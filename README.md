@@ -12,6 +12,39 @@ patches prioritize correctness and installability; some operators use
 CPU-assisted MPS dispatch shims and remain candidates for dedicated Metal
 kernels.
 
+## Install in your own project
+
+The patched `pyg-lib` (with the native + fused Metal MPS scatter kernels) lives
+on a fork branch and installs into any fresh `uv` project. This recipe is tested
+end-to-end on Apple Silicon:
+
+```bash
+# 1. Clone the fork. METIS has a nested GKlib submodule, so --recursive is
+#    required; only these two submodules are needed for the macOS build.
+git clone -b macos-mps-scatter https://github.com/zzccppp/pyg-lib.git
+git -C pyg-lib submodule update --init --recursive \
+    third_party/METIS third_party/parallel-hashmap
+
+# 2. Fresh uv environment with torch + build tools.
+uv venv --python 3.12
+uv pip install torch setuptools wheel ninja
+
+# 3. Build + install pyg-lib. --no-build-isolation is required because
+#    pyg-lib's setup.py imports torch at build time.
+uv pip install --no-build-isolation ./pyg-lib
+```
+
+Then the fused Metal scatter kernel runs on MPS:
+
+```python
+import torch
+from pyg_lib import ops
+
+src = torch.randn(50_000, 32, device="mps")
+index = torch.randint(0, 500, (50_000,), device="mps")
+value, argmax = ops.scatter_max(src, index, dim=0, dim_size=500)  # both on mps:0
+```
+
 ## Quick Start
 
 Use a direct macOS terminal for MPS validation. Codex sandbox shells can make
