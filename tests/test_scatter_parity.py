@@ -201,21 +201,24 @@ def test_arg_points_to_reduced_value(op_name: str) -> None:
 
 
 @pytest.mark.parametrize("op_name", list(_ARG_OPS))
-def test_metal_heavy_contention_ties(op_name: str) -> None:
+@pytest.mark.parametrize("dtype", _FLOAT_DTYPES)
+def test_metal_heavy_contention_ties(op_name: str, dtype: torch.dtype) -> None:
     """Fused Metal path: heavy contention + many exact ties, value+arg exact.
 
     Few nodes and many integer-valued edges force thousands of collisions per
     output cell with frequent ties -- the case where an atomic race or a bad
-    tie-break in the kernel would surface. Requires exact equality vs the CPU
-    kernel (first-occurrence tie-break).
+    tie-break in the kernel would surface. Integer values in [-4, 4] are exactly
+    representable in fp16/bf16, and the kernel promotes to float32 losslessly, so
+    every dtype must match the CPU kernel exactly (first-occurrence tie-break).
     """
     torch.manual_seed(7)
     E, F, N = 60_000, 8, 32  # ~1900 edges/node
-    src = torch.randint(-4, 5, (E, F)).float()  # integer values => many ties
+    src = torch.randint(-4, 5, (E, F)).to(dtype)  # integer values => many ties
     index = torch.randint(0, N, (E,), dtype=torch.long)
 
     val, arg = _ARG_OPS[op_name](src.to("mps"), index.to("mps"), dim=0, dim_size=N)
     ref_val, ref_arg = _ARG_OPS[op_name](src.cpu(), index.cpu(), dim=0, dim_size=N)
+    assert val.dtype == dtype
     torch.testing.assert_close(val.cpu(), ref_val, rtol=0, atol=0)
     torch.testing.assert_close(arg.cpu(), ref_arg, rtol=0, atol=0)
 
