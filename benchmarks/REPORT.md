@@ -1,17 +1,16 @@
 # Scatter-Family MPS Benchmark Report
 
-This report measures the `pyg-lib` scatter operators on Apple Silicon and
-quantifies two things:
-
-1. what the **on-device int32 argmin/argmax** path buys over the earlier
-   approach that computed arg indices through a CPU round-trip, and
-2. when the **native MPS** scatter kernels actually beat CPU.
+This report measures the `pyg-lib` scatter operators on Apple Silicon. The
+headline result is the **fused Metal kernel** for `scatter_min`/`scatter_max`,
+which computes the reduced value **and** its arg index in a single atomic pass,
+replacing a five-op tensor sequence (scatter_reduce, gather, eq, where,
+scatter_reduce).
 
 ## Setup
 
 | Item | Value |
 |------|-------|
-| Platform | macOS 26.5.1, arm64 (Apple Silicon) |
+| Platform | macOS 26.5.1, Apple M4 Pro (Apple9 GPU family), Metal 4 |
 | PyTorch | 2.12.1 |
 | `pyg-lib` | 0.8.0 (local source build, MPS patches applied) |
 | Feature dim | 64 |
@@ -25,68 +24,73 @@ Reproduce with:
 ./scripts/uv_stage.sh report      # writes the PNGs below
 ```
 
-## Result 1 — on-device int32 arg vs CPU-arg round-trip
+## Result 1 — the fused Metal kernel
 
-`scatter_min`/`scatter_max` need an arg index, but MPS has no int64
-`scatter_reduce`. The earlier shim reduced values on MPS and recovered the arg
-on CPU (copy in, int64 reduce, copy back) on **every call**. The current kernel
-does the whole arg reduction on-device in int32 and widens to int64 at the end.
+`scatter_min`/`scatter_max` need both a reduced value and the source index that
+produced it. MPS has no int64 `scatter_reduce`, so earlier iterations computed
+the arg index either through a CPU round-trip or through an on-device int32
+sequence of five generic kernels. The fused kernel instead packs an
+order-preserving `uint` transform of the value in the high 32 bits and the
+complemented source position in the low 32 bits of a 64-bit word, then does one
+`atomic_max` per element. A cheap second kernel unpacks the keys. Ties resolve to
+the first occurrence (matching the CPU kernel) because the complemented position
+makes the smallest index win.
 
-![scatter_max: on-device int32 arg vs CPU-arg round-trip](scatter_max_arg.png)
+![scatter_max: fused Metal kernel vs tensor-op paths](scatter_max_arg.png)
 
-| edges | native MPS (ms) | MPS + CPU arg (ms) | speedup |
-|------:|----------------:|-------------------:|--------:|
-| 10,000 | 0.78 | 1.72 | **2.20×** |
-| 50,000 | 3.32 | 6.91 | **2.08×** |
-| 100,000 | 13.15 | 16.13 | 1.23× |
-| 500,000 | 76.04 | 88.06 | 1.16× |
-| 1,000,000 | 184.26 | 214.24 | 1.16× |
+| edges | fused Metal (ms) | int32 5-op (ms) | speedup | CPU (ms) | vs CPU |
+|------:|-----------------:|----------------:|--------:|---------:|-------:|
+| 10,000 | 0.149 | 0.642 | 4.3× | 1.455 | 9.8× |
+| 50,000 | 0.234 | 3.476 | 14.9× | 6.894 | 29× |
+| 100,000 | 0.416 | 11.360 | 27× | 14.087 | 34× |
+| 500,000 | 2.553 | 71.380 | 28× | 87.809 | 34× |
+| 1,000,000 | 5.885 | 177.059 | **30×** | 209.769 | **36×** |
 
-**Reading:** the win is largest (≈2×) at 10k–50k edges — typical mini-batch /
-neighborhood-sampling scale — because the CPU round-trip is a fixed
-per-call latency (device→host→device copies plus a host-side kernel launch)
-that dominates when the reduction itself is cheap. At 1M edges the copies are
-amortized against a much heavier reduction, but removing them still saves ~16%.
-The old path was also consistently **slower than plain CPU** at small sizes
-(1.72 vs 1.47 ms at 10k) — i.e. it was worse than not using the GPU at all —
-whereas the native path is faster than both.
+**Reading:** the fused kernel is **4–30× faster than the previous native path**
+and **10–36× faster than CPU**, with the gap widening as the graph grows because
+the fused kernel makes one pass over the source instead of five and avoids the
+generic `scatter_reduce` machinery entirely. At 1M edges it reduces a 177 ms
+operation to under 6 ms. Correctness (value **and** arg, including tie-breaking
+under heavy atomic contention) is verified against the CPU kernel and
+`torch_scatter` in `tests/test_scatter_parity.py`.
 
-## Result 2 — native MPS vs CPU
+The kernel covers the message-passing hot path: 2-D float32 `src`, `dim == 0`,
+and a column-broadcast index (what PyG produces from a 1-D edge index). Other
+shapes/dtypes (fp16/bf16, `dim != 0`, genuine 2-D index) fall back to the
+portable int32 tensor path, which remains correct and tested.
 
-![Native MPS scatter speedup over CPU vs graph size](native_vs_cpu.png)
+## Result 2 — hand-written kernel vs relying on generic ops
 
-| edges | sum MPS/CPU (ms) | mean MPS/CPU (ms) | max MPS/CPU (ms) |
-|------:|-----------------:|------------------:|-----------------:|
-| 10,000 | 0.77 / 0.33 | 0.60 / 0.36 | 0.78 / 1.47 |
-| 50,000 | 1.33 / 1.42 | 1.38 / 1.54 | 3.32 / 7.29 |
-| 100,000 | 4.79 / 3.24 | 4.91 / 3.15 | 13.15 / 14.41 |
-| 500,000 | 23.24 / 21.56 | 23.45 / 27.61 | 76.04 / 86.93 |
-| 1,000,000 | 60.30 / 85.67 | 61.01 / 99.71 | 184.26 / 205.92 |
+![MPS scatter speedup over CPU vs graph size](native_vs_cpu.png)
 
-**Reading:** native MPS is **not a blanket win** on this hardware. For
-`scatter_sum`/`scatter_mean` the GPU only pays off past ~500k edges (1.4–1.6× at
-1M), and loses at small graphs where dispatch overhead outweighs the compute and
-Apple's unified memory keeps CPU competitive. `scatter_max` benefits from MPS
-across the whole range because its heavier arithmetic (a 5-op arg derivation)
-gives the GPU more to chew on. This is the honest, data-driven takeaway: ship the
-native kernels, but a production message-passing layer on small graphs should
-not assume MPS is automatically faster.
+| edges | sum MPS/CPU (ms) | mean MPS/CPU (ms) | max (fused) MPS/CPU (ms) |
+|------:|-----------------:|------------------:|-------------------------:|
+| 10,000 | 0.77 / 0.33 | 0.60 / 0.36 | 0.149 / 1.455 |
+| 100,000 | 4.79 / 3.24 | 4.91 / 3.15 | 0.416 / 14.087 |
+| 1,000,000 | 60.30 / 85.67 | 61.01 / 99.71 | 5.885 / 209.769 |
 
-### The reproducible 100k dip
+**Reading:** `scatter_sum`/`scatter_mean` use PyTorch's native `scatter_add_`
+kernel and only edge past CPU beyond ~500k edges (1.4–1.6× at 1M). The fused
+`scatter_max` kernel, by contrast, is 10–36× faster than CPU across the whole
+range. The lesson is concrete: on MPS, relying on generic reductions leaves most
+of the GPU on the table; a purpose-built kernel for the hot path is where the
+win is.
 
-The MPS `scatter_sum`/`scatter_mean` curves show a real, reproducible slowdown
-near 100k edges (4.79 ms at 100k vs 1.33 ms at 50k — a 3.6× jump for 2× data,
-stable across runs). This is not measurement noise; it looks like an MPS
-allocation/tiling threshold. It is left in the charts rather than smoothed away
-because it is a genuine characteristic of the backend at this size.
+## Other operators — where a Metal kernel is (and isn't) worth it
 
-## What this implies for next steps
+- **`scatter_sum` / `scatter_mul` / `scatter_mean`:** already dispatch to
+  PyTorch's native MPS `scatter_add_` / `scatter_reduce_`, which are single
+  optimized kernels. A hand-written atomic-add kernel would contend with
+  PyTorch's own implementation for little gain (and float atomic-add contention
+  can be worse), so these are left on the native path.
+- **`scatter_min` / `scatter_max`:** the clear win — a fused Metal kernel,
+  shipped here.
+- **Point-cloud (`knn`, `radius`, `fps`, ...) and spline ops:** remain
+  CPU-assisted. They are preprocessing, called rarely, and a Metal port would
+  require spatial data structures for a fraction of the benefit the scatter hot
+  path delivers. Deferred by design, not by omission.
 
-- **Fuse the `scatter_max` arg kernel.** At 1M edges `scatter_max` costs ~3×
-  `scatter_sum` on MPS (184 vs 60 ms) because the on-device arg path is five
-  tensor ops (reduce, gather, eq, where, reduce). A single hand-written Metal
-  kernel that computes value and arg in one pass is the highest-value follow-up.
-- **Keep point-cloud/spline ops CPU-assisted.** They are preprocessing, called
-  rarely; the benchmarks confirm effort belongs on the scatter hot path.
-- **Guard small-graph paths.** Below ~50k edges, CPU can beat MPS for
-  sum/mean — worth a device heuristic in downstream code.
+## Next steps
+
+- Extend the fused kernel to fp16/bf16 `src` (currently falls back).
+- A fused segment-CSR max could give the same treatment to sorted-index paths.

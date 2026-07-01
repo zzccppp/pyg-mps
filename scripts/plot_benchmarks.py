@@ -39,20 +39,17 @@ def _select(
 
 
 def plot_scatter_max_arg(rows: list[dict[str, Any]], out: Path) -> None:
-    """Compare the int32 on-device arg path against the CPU-arg round-trip."""
+    """Show the scatter_max progression: fused Metal vs tensor paths vs CPU."""
     series = {
-        "native MPS (int32 arg, on-device)": ("scatter_max", "mps"),
-        "MPS value + CPU arg (previous path)": ("scatter_max_cpu_arg", "mps"),
+        "fused Metal kernel (single pass)": ("scatter_max", "mps"),
+        "int32 tensor path (5 ops)": ("scatter_max_int32_5op", "mps"),
+        "MPS value + CPU arg": ("scatter_max_cpu_arg", "mps"),
         "CPU": ("scatter_max", "cpu"),
     }
     styles = {
-        "native MPS (int32 arg, on-device)": {"marker": "o", "color": "#1b7837", "lw": 2},
-        "MPS value + CPU arg (previous path)": {
-            "marker": "s",
-            "color": "#d95f02",
-            "ls": "--",
-            "lw": 2,
-        },
+        "fused Metal kernel (single pass)": {"marker": "o", "color": "#1b7837", "lw": 2.5},
+        "int32 tensor path (5 ops)": {"marker": "s", "color": "#d95f02", "ls": "--", "lw": 2},
+        "MPS value + CPU arg": {"marker": "D", "color": "#e7298a", "ls": "-.", "lw": 1.5},
         "CPU": {"marker": "^", "color": "#7570b3", "ls": ":", "lw": 2},
     }
 
@@ -66,19 +63,19 @@ def plot_scatter_max_arg(rows: list[dict[str, Any]], out: Path) -> None:
     ax.set_yscale("log")
     ax.set_xlabel("edges (messages)")
     ax.set_ylabel("time per call (ms, median)")
-    ax.set_title("scatter_max on MPS: on-device int32 arg vs CPU-arg round-trip")
+    ax.set_title("scatter_max on MPS: fused Metal kernel vs tensor-op paths")
     ax.grid(True, which="both", ls=":", alpha=0.4)
     ax.legend()
 
-    # Annotate the speedup of native over the CPU-arg path at the smallest size.
-    n_edges, n_ms = _select(rows, "scatter_max", "mps")
-    c_edges, c_ms = _select(rows, "scatter_max_cpu_arg", "mps")
-    if n_ms and c_ms:
-        speedup = c_ms[0] / n_ms[0]
+    # Annotate the fused speedup over the previous (5-op) native path at 1M.
+    f_edges, f_ms = _select(rows, "scatter_max", "mps")
+    p_edges, p_ms = _select(rows, "scatter_max_int32_5op", "mps")
+    if f_ms and p_ms:
+        speedup = p_ms[-1] / f_ms[-1]
         ax.annotate(
-            f"{speedup:.1f}x faster",
-            xy=(n_edges[0], n_ms[0]),
-            xytext=(n_edges[0] * 1.5, n_ms[0] * 0.4),
+            f"{speedup:.0f}x faster\nthan 5-op path",
+            xy=(f_edges[-1], f_ms[-1]),
+            xytext=(f_edges[-1] * 0.28, f_ms[-1] * 3.0),
             arrowprops={"arrowstyle": "->", "color": "#1b7837"},
             color="#1b7837",
             fontweight="bold",
@@ -105,14 +102,12 @@ def plot_native_vs_cpu(rows: list[dict[str, Any]], out: Path) -> None:
         ax.plot(m_edges, speedup, marker="o", lw=2, color=colors[op], label=op)
 
     ax.axhline(1.0, color="black", ls="--", lw=1, alpha=0.6)
-    ax.text(
-        ax.get_xlim()[0], 1.02, "MPS faster above / CPU faster below",
-        fontsize=8, color="black", alpha=0.7,
-    )
     ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.set_xlabel("edges (messages)")
-    ax.set_ylabel("speedup (CPU time / MPS time)")
-    ax.set_title("Native MPS scatter speedup over CPU vs graph size")
+    ax.set_ylabel("speedup (CPU time / MPS time, log scale)")
+    ax.set_title("MPS scatter speedup over CPU vs graph size\n"
+                 "(scatter_max uses the fused Metal kernel)")
     ax.grid(True, which="both", ls=":", alpha=0.4)
     ax.legend()
 

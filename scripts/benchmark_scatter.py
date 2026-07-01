@@ -114,6 +114,38 @@ def scatter_max_mps_cpu_arg(
     return out, arg_cpu.to(device)
 
 
+def scatter_max_int32_5op(
+    src: torch.Tensor, index: torch.Tensor, dim_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference for the previous *native* path: value + int32 arg in 5 ops.
+
+    Reproduces the on-device tensor-op implementation the fused Metal kernel
+    replaces (scatter_reduce, gather, eq, where, scatter_reduce), so the
+    benchmark shows what fusing into a single atomic pass saved.
+    """
+    device = src.device
+    out = torch.full(
+        (dim_size, src.size(1)), float("-inf"), device=device, dtype=src.dtype
+    )
+    idx = index.unsqueeze(-1).expand_as(src)
+    out.scatter_reduce_(0, idx, src, "amax", include_self=True)
+
+    gathered = out.gather(0, idx)
+    sentinel = src.size(0)
+    positions = (
+        torch.arange(src.size(0), dtype=torch.int32, device=device)
+        .view(-1, 1)
+        .expand_as(idx)
+    )
+    candidates = torch.where(
+        src.eq(gathered), positions, torch.full_like(positions, sentinel)
+    )
+    arg = torch.full((dim_size, src.size(1)), sentinel, dtype=torch.int32, device=device)
+    arg.scatter_reduce_(0, idx, candidates, "amin", include_self=True)
+    out = out.masked_fill(arg == sentinel, 0)
+    return out, arg.long()
+
+
 def build_cases(
     device: str, dtype: torch.dtype
 ) -> dict[str, Callable[[torch.Tensor, torch.Tensor, int], Any]]:
@@ -121,9 +153,13 @@ def build_cases(
     cases: dict[str, Callable[[torch.Tensor, torch.Tensor, int], Any]] = {
         "scatter_sum": lambda s, i, n: ops.scatter_sum(s, i, dim=0, dim_size=n),
         "scatter_mean": lambda s, i, n: ops.scatter_mean(s, i, dim=0, dim_size=n),
+        # scatter_max on MPS now dispatches to the fused Metal kernel.
         "scatter_max": lambda s, i, n: ops.scatter_max(s, i, dim=0, dim_size=n),
     }
     if device == "mps":
+        cases["scatter_max_int32_5op"] = (
+            lambda s, i, n: scatter_max_int32_5op(s, i, n)
+        )
         cases["scatter_max_cpu_arg"] = (
             lambda s, i, n: scatter_max_mps_cpu_arg(s, i, n)
         )
