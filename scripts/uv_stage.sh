@@ -178,6 +178,12 @@ case "${stage}" in
     warn_sandbox
     "${venv_python}" scripts/extension_probe.py --device mps
     ;;
+  parity)
+    ensure_venv
+    warn_sandbox
+    "${venv_python}" -c "import pytest" 2>/dev/null || uv pip install pytest
+    "${venv_python}" -m pytest tests/test_scatter_parity.py -v
+    ;;
   example)
     ensure_venv
     "${venv_python}" examples/gcn_mps_smoke.py
@@ -244,6 +250,7 @@ Known stages:
   meta
   extensions-cpu
   extensions-mps
+  parity
   example
   list
   summary
