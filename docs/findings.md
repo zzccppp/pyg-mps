@@ -268,3 +268,57 @@ Reproduce the current MPS compatibility milestone from a direct macOS shell:
 
 After the latest probe changes, native missing MPS kernels should appear as
 `unsupported`, not generic `failed`.
+
+## 2026-07-01: Native on-device int32 arg path for `scatter_min`/`scatter_max`
+
+The earlier `scatter_min`/`scatter_max` shim reduced values on MPS but computed
+the arg indices on CPU, because MPS raises `RuntimeError: not supported for
+torch.int64` for `scatter_reduce_`. That CPU round-trip ran on every call, which
+is a real cost in a message-passing training loop.
+
+Direct-shell experiment on `torch==2.12.1` isolates the constraint to the dtype,
+not the reduction:
+
+- `scatter_reduce_(..., "amin")` with `torch.int64` on MPS: fails.
+- `scatter_reduce_(..., "amin")` with `torch.int32` on MPS: works, with either
+  int32 or int64 index tensors.
+- `scatter_reduce_(..., "amax")` with `torch.float32` on MPS: works.
+
+The MPS kernel now derives the arg index **entirely on-device** using int32:
+
+- flag each source position whose value equals its group's reduced value
+  (exact float equality is valid because `amin`/`amax` select an actual source
+  element rather than computing a new value),
+- take the smallest such position per group with an int32
+  `scatter_reduce_(..., "amin")`,
+- widen the int32 arg to int64 before returning, matching pyg-lib's contract.
+
+A `TORCH_CHECK` guards the int32 range (`src.size(dim) < 2^31`), which holds for
+any realistic graph. The patch keeps zero `.cpu()` calls on the min/max path.
+
+Verified from a direct macOS shell:
+
+- `pyg_lib.ops.scatter_min`/`scatter_max`: values and arg indices both return on
+  `mps:0`; arg dtype is `int64`.
+- Numerical parity vs the CPU `pyg-lib` kernel and vs `torch_scatter`
+  (`tests/test_scatter_parity.py`, 26 cases): exact match, including tie
+  first-occurrence semantics and empty-group `arg == src.size(dim)`.
+
+The patch is regenerated into
+`patches/pyg-lib/0002-add-scatter-family-mps-dispatch.patch`.
+
+## 2026-07-01: Honest native vs CPU-assisted probe classification
+
+The `21 ok` headline conflated true GPU execution with operators that merely
+accept MPS tensors and run on CPU internally. An `ok` on `mps:0` only reflects
+the final copy-back, not where the compute happened. The probe now tags every
+successful MPS case with an `impl` field and the summary reports the split:
+
+- `pyg-macos-native`: `21 ok = 12 native + 9 cpu-assisted`.
+- Native (12): torch core ops, PyG `Data.to` and `GCNConv`, and the full
+  `pyg-lib` scatter family (`scatter_sum`, `scatter_mul`, `scatter_mean`,
+  `scatter_min`, `scatter_max`).
+- CPU-assisted (9): PyG `knn_graph` and `SplineConv`, and direct `pyg-lib`
+  `knn`, `radius`, `nearest`, `fps`, `grid_cluster`, `spline_basis`, and
+  `spline_weighting`. These remain CPU-assisted by design; they are
+  preprocessing ops that profiling has not shown to be hot.

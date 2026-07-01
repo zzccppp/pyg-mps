@@ -63,9 +63,13 @@ Success criteria:
 ## Milestone 3: Native MPS Kernel Prototypes
 
 Status: compatibility milestone complete for the current probe suite. The full
-scatter family is verified on real MPS. `scatter_min` and `scatter_max` use a
-CPU-assisted argindex path while keeping value reduction on MPS. Point-cloud
-and spline operators are verified through CPU-assisted MPS dispatch shims.
+scatter family is verified on real MPS and is now **fully native**:
+`scatter_min` and `scatter_max` reduce values with MPS `scatter_reduce` and
+derive arg indices entirely on-device in int32 (working around Metal's missing
+int64 `scatter_reduce`), with numerical parity tests against CPU and
+`torch_scatter`. Point-cloud and spline operators remain CPU-assisted MPS
+dispatch shims by design. The probe now reports the native vs CPU-assisted
+split explicitly: `21 ok = 12 native + 9 cpu-assisted`.
 
 Candidate first kernels:
 
@@ -75,8 +79,9 @@ Candidate first kernels:
 - `pyg::scatter_mean`: verified through the composite implementation over
   `scatter_sum`.
 - `pyg::scatter_min`, `pyg::scatter_max`: value reduction uses MPS
-  `scatter_reduce_`; argindex computation uses a CPU helper because MPS does
-  not support the required int64 reduction path. Verified on real MPS.
+  `scatter_reduce_`; argindex computation runs on-device in int32 because MPS
+  does not support the int64 reduction path, then widens to int64. No CPU
+  round-trip. Verified on real MPS with parity tests.
 - `pyg::knn`, `pyg::radius`, `pyg::nearest`, `pyg::fps`, `pyg::grid_cluster`:
   CPU-assisted MPS shims are verified on real MPS.
 - `pyg::spline_basis` and `pyg::spline_weighting`: CPU-assisted MPS shims

@@ -47,10 +47,24 @@ Direct-shell MPS results on this host:
   `torch-scatter==2.1.2`, `torch-sparse==0.6.18`, `torch-cluster==1.6.3`,
   and `torch-spline-conv==1.2.2`.
 - Local patched `pyg-lib==0.8.0`: the no-fallback `pyg-macos-native` probe now
-  reports `21 ok / 0 unsupported / 0 failed` on MPS.
-- The verified path includes PyG high-level `knn_graph` and `SplineConv`, plus
-  direct `pyg-lib` point-cloud, spline, and scatter-family operators returning
-  tensors on `mps:0`.
+  reports `21 ok / 0 unsupported / 0 failed` on MPS. Crucially, the probe splits
+  those 21 `ok` cases by *how* they execute: **12 native** (GPU execution via
+  standard PyTorch or native `pyg-lib` MPS kernels) and **9 cpu-assisted** (the
+  operator accepts MPS tensors but copies to CPU and back). A bare `ok` on
+  `mps:0` does not by itself prove GPU execution, so the reports make the
+  distinction explicit.
+- Native MPS kernels: the full `pyg-lib` scatter family (`scatter_sum`,
+  `scatter_mul`, `scatter_mean`, `scatter_min`, `scatter_max`). `scatter_min`
+  and `scatter_max` reduce values with MPS `scatter_reduce` and derive the arg
+  indices **entirely on-device in int32**, working around Metal's lack of an
+  int64 `scatter_reduce` kernel; the int32 arg is widened to int64 before
+  returning. Numerical parity against the CPU kernel and `torch_scatter` is
+  covered by `tests/test_scatter_parity.py`.
+- CPU-assisted shims (intentional, for rarely-hot preprocessing ops): PyG
+  `knn_graph` and `SplineConv`, plus direct `pyg-lib` `knn`, `radius`,
+  `nearest`, `fps`, `grid_cluster`, `spline_basis`, and `spline_weighting`.
+  These are candidates for dedicated Metal kernels only if profiling shows they
+  matter.
 - `PYTORCH_ENABLE_MPS_FALLBACK=1`: the same probe also reports
   `21 ok / 0 unsupported / 0 failed`, but fallback is no longer required for
   the probed patched `pyg-lib` path.
@@ -86,6 +100,12 @@ Build from local source checkouts:
 ./scripts/uv_stage.sh install-local-optionals
 ./scripts/uv_stage.sh meta
 ./scripts/uv_stage.sh extensions-cpu
+```
+
+Run the scatter-family numerical parity suite (MPS vs CPU vs `torch_scatter`):
+
+```bash
+./scripts/uv_stage.sh parity
 ```
 
 `install-local` installs editable `torch-geometric` and `pyg-lib` from `src/`.
