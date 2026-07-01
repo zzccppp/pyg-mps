@@ -322,3 +322,49 @@ successful MPS case with an `impl` field and the summary reports the split:
   `knn`, `radius`, `nearest`, `fps`, `grid_cluster`, `spline_basis`, and
   `spline_weighting`. These remain CPU-assisted by design; they are
   preprocessing ops that profiling has not shown to be hot.
+
+## 2026-07-01: Fused single-pass Metal kernel for `scatter_min`/`scatter_max`
+
+Profiling showed the int32 tensor-op arg path cost ~3x `scatter_sum` on MPS at
+1M edges because it ran five generic kernels (scatter_reduce, gather, eq, where,
+scatter_reduce). This was replaced with a hand-written Metal kernel.
+
+Host: Apple M4 Pro (Apple9 GPU family), Metal 4. This GPU supports 64-bit
+atomics, which is what makes a genuine single-pass fused argmax possible.
+
+Kernel design (`pyg_lib/csrc/ops/mps/scatter_metal.mm`):
+
+- Pack an order-preserving `uint` transform of the float value in the high 32
+  bits and the bit-complemented source position in the low 32 bits of a 64-bit
+  word, then `atomic_max` per element into the target cell. A larger value
+  wins; on a tie, the complemented position makes the smallest source index win
+  (first-occurrence, matching the CPU kernel). `min` stores `~transform` so the
+  smallest value yields the largest key.
+- A second cheap kernel unpacks the 64-bit keys into the value and int64 arg
+  tensors. Empty cells (key high bits == 0) become value 0 and arg
+  `src.size(dim)`, matching upstream.
+
+Integration:
+
+- Registered for MPS via `TORCH_LIBRARY_IMPL(pyg, MPS, m)` in the `.mm`; the
+  tensor-op `scatter_min`/`scatter_max` registration was removed from
+  `mps/scatter_kernel.cpp` to avoid a double registration.
+- The kernel covers the hot path (2-D float32 `src`, `dim == 0`,
+  column-broadcast index from a 1-D edge index). All other shapes/dtypes fall
+  back to the portable int32 tensor path, which is retained in the `.mm`.
+- CMake builds `mps/*.mm` as Objective-C++ on APPLE and links `Metal` and
+  `Foundation`. Pipelines are compiled once (thread-safe function-local static);
+  if 64-bit atomics or the Metal toolchain are unavailable, the kernel reports
+  itself unavailable and callers use the tensor fallback.
+- Tracked as `patches/pyg-lib/0004-add-fused-metal-scatter-kernel.patch` (plus
+  the regenerated `0002`).
+
+Correctness (`tests/test_scatter_parity.py`, 30 cases): exact value and arg
+parity vs the CPU kernel and `torch_scatter`, including a heavy-contention
+stress test (60k edges into 32 nodes, integer values forcing many ties) that
+would expose an atomic race or bad tie-break, plus a fallback-routing test.
+
+Performance (`benchmarks/REPORT.md`): the fused kernel is 4-30x faster than the
+five-op path and 10-36x faster than CPU; at 1M edges it drops `scatter_max` from
+177 ms to 5.9 ms. Native/CPU-assisted probe counts are unchanged (still 12/9);
+`scatter_min`/`scatter_max` remain native but are now Metal-backed.

@@ -78,10 +78,14 @@ Candidate first kernels:
 - `pyg::scatter_mul`: verified through PyTorch's MPS `scatter_reduce_` path.
 - `pyg::scatter_mean`: verified through the composite implementation over
   `scatter_sum`.
-- `pyg::scatter_min`, `pyg::scatter_max`: value reduction uses MPS
-  `scatter_reduce_`; argindex computation runs on-device in int32 because MPS
-  does not support the int64 reduction path, then widens to int64. No CPU
-  round-trip. Verified on real MPS with parity tests.
+- `pyg::scatter_min`, `pyg::scatter_max`: **fused single-pass Metal kernel**
+  (`mps/scatter_metal.mm`). Value and arg index are computed together via a
+  64-bit atomic that packs an order-preserving value transform with the source
+  position; a second kernel unpacks. 4-30x faster than the prior five-op tensor
+  path and 10-36x faster than CPU. Covers the message-passing hot path (2-D
+  float32, `dim == 0`, broadcast index); other cases fall back to the int32
+  tensor path. Verified with heavy-contention parity tests. This is the first
+  dedicated Metal kernel and the model for future ones.
 - `pyg::knn`, `pyg::radius`, `pyg::nearest`, `pyg::fps`, `pyg::grid_cluster`:
   CPU-assisted MPS shims are verified on real MPS.
 - `pyg::spline_basis` and `pyg::spline_weighting`: CPU-assisted MPS shims

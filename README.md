@@ -77,15 +77,17 @@ See [docs/findings.md](docs/findings.md) for the evidence trail and
 
 ## Benchmarks
 
-[benchmarks/REPORT.md](benchmarks/REPORT.md) quantifies the native MPS scatter
-kernels. Headlines on this host (macOS 26.5.1, Apple Silicon, `torch==2.12.1`):
+[benchmarks/REPORT.md](benchmarks/REPORT.md) quantifies the MPS scatter kernels.
+Headlines on this host (macOS 26.5.1, Apple M4 Pro, `torch==2.12.1`):
 
-- The on-device int32 argmin/argmax path is **up to ~2.2× faster** than the
-  earlier MPS-value/CPU-arg approach at 10k–50k edges, and ~16% faster at 1M
-  edges, by removing a per-call CPU round-trip.
-- Native MPS `scatter_sum`/`scatter_mean` overtake CPU past ~500k edges
-  (1.4–1.6× at 1M) but lose on small graphs — native kernels are worth shipping,
-  but MPS is not automatically faster at every size.
+- `scatter_min`/`scatter_max` use a **fused single-pass Metal kernel**
+  (`pyg_lib/csrc/ops/mps/scatter_metal.mm`) that computes value and arg together
+  via a 64-bit atomic. It is **4–30× faster than the previous tensor-op path**
+  and **10–36× faster than CPU**, dropping `scatter_max` at 1M edges from 177 ms
+  to 5.9 ms.
+- `scatter_sum`/`scatter_mean` use PyTorch's native `scatter_add_` and only edge
+  past CPU beyond ~500k edges — a purpose-built kernel for the hot path is where
+  the real win is.
 
 Regenerate with `./scripts/uv_stage.sh benchmark` then `./scripts/uv_stage.sh report`.
 

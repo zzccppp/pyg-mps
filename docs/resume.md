@@ -19,10 +19,19 @@ operator-level failure classification.
   with native MPS kernels from those blocked by Metal's lack of int64 integer
   reductions, and registered the missing backends via `TORCH_LIBRARY_IMPL(pyg,
   MPS/Meta, m)`.
-- Implemented native-MPS scatter reductions for `pyg-lib`; engineered an
-  int32-based **on-device** argmin/argmax to bypass MPS's missing int64
-  `scatter_reduce`, eliminating a per-call CPU round-trip in the message-passing
-  hot path.
+- Wrote a **fused single-pass Metal kernel** for `scatter_min`/`scatter_max`
+  that computes the reduced value and its arg index together via a 64-bit atomic
+  (order-preserving float→uint packing + complemented-index tie-break),
+  replacing a five-op tensor sequence. **4–30× faster than the prior path and
+  10–36× faster than CPU** (177 ms → 5.9 ms at 1M edges), verified for exact
+  value/arg parity under heavy atomic contention.
+- Engineered the pre-Metal fallback too: an int32-based **on-device**
+  argmin/argmax to bypass MPS's missing int64 `scatter_reduce`, eliminating a
+  per-call CPU round-trip; it remains the correctness fallback for
+  shapes/dtypes outside the Metal fast path.
+- Integrated Objective-C++ Metal kernels into `pyg-lib`'s CMake build (compile
+  `*.mm`, link Metal/Foundation), dispatching on PyTorch's MPS command buffer
+  via `torch::mps`, with runtime-compiled pipelines cached once.
 - Built a numerical parity harness (MPS vs CPU kernel vs `torch_scatter`)
   covering dtypes, tie-breaking, empty groups, and multi-dimensional inputs, and
   a probe that classifies each operator as native / CPU-assisted / unsupported
@@ -49,6 +58,12 @@ number, which an interviewer who knows PyTorch will (correctly) probe.
   is therefore computed on-device in int32 (safe because graph indices are far
   below 2^31) and widened to int64 on the way out. This is the key trick that
   turns the weakest op into a fully native one without a CPU round-trip.
+- The fused Metal kernel packs `(order_preserving_value << 32 | ~index)` into a
+  64-bit word and does one `atomic_max` per element, so a single atomic pass
+  yields both the reduced value and a first-occurrence arg index. It needs
+  64-bit atomics (Apple GPU family 8/9); the design falls back gracefully where
+  they are unavailable. This is the argmax-scatter analogue of the classic
+  key-value packing used in GPU reductions.
 - A hardcoded per-op CPU shim is functionally identical to the global MPS
   fallback; the honest way to report it is as a distinct "CPU-assisted" class,
   not as a native MPS win.
