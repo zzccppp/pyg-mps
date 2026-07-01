@@ -223,17 +223,65 @@ def test_metal_heavy_contention_ties(op_name: str, dtype: torch.dtype) -> None:
     torch.testing.assert_close(arg.cpu(), ref_arg, rtol=0, atol=0)
 
 
+# The Metal kernel handles an arbitrary `dim` (viewing src as [outer, D, inner])
+# and both broadcast and genuine per-element indices. Each entry is
+# (shape, dim, dim_size, genuine_index).
+_GENERAL_CASES = [
+    ((64, 300), 1, 20, False),  # 2-D, reduce along dim 1, broadcast index
+    ((300, 80), 1, 12, True),   # 2-D, reduce along dim 1, genuine 2-D index
+    ((300, 40), 0, 15, True),   # 2-D, reduce along dim 0, genuine 2-D index
+    ((4, 200, 6), 1, 25, False),  # 3-D, reduce along dim 1, broadcast index
+    ((4, 5, 120), 2, 16, True),   # 3-D, reduce along dim 2, genuine index
+    ((50, 300), -1, 10, False),   # negative dim
+]
+
+
 @pytest.mark.parametrize("op_name", list(_ARG_OPS))
-def test_fallback_genuine_2d_index(op_name: str) -> None:
-    """A non-broadcast 2-D index bypasses the Metal fast path and stays correct."""
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("shape,dim,dim_size,genuine", _GENERAL_CASES)
+def test_metal_general_dim_and_index(
+    op_name: str,
+    dtype: torch.dtype,
+    shape: tuple,
+    dim: int,
+    dim_size: int,
+    genuine: bool,
+) -> None:
+    """Fused Metal path across arbitrary dim, rank, index mode, and dtype."""
+    torch.manual_seed(9)
+    # Integer values are exact in every dtype, so require exact value+arg parity.
+    src = torch.randint(-9, 10, shape).to(dtype)
+    reduce_dim = dim % src.dim()
+    if genuine:
+        index = torch.randint(0, dim_size, shape, dtype=torch.long)
+    else:
+        index = torch.randint(0, dim_size, (shape[reduce_dim],), dtype=torch.long)
+
+    val, arg = _ARG_OPS[op_name](
+        src.to("mps"), index.to("mps"), dim=dim, dim_size=dim_size
+    )
+    ref_val, ref_arg = _ARG_OPS[op_name](
+        src.cpu(), index.cpu(), dim=dim, dim_size=dim_size
+    )
+    assert val.dtype == dtype
+    torch.testing.assert_close(val.cpu(), ref_val, rtol=0, atol=0)
+    torch.testing.assert_close(arg.cpu(), ref_arg, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("op_name", list(_ARG_OPS))
+def test_fallback_integer_dtype(op_name: str) -> None:
+    """int32 src is outside the Metal float fast path; the tensor fallback holds.
+
+    (float64 is not usable here because MPS does not support double tensors, so an
+    integer dtype is the cleanest MPS-supported trigger for the fallback.)
+    """
     torch.manual_seed(8)
-    src = torch.randn(1000, 4)
-    # Distinct target per (row, col): stride(1) != 0, so the kernel falls back.
-    index = torch.randint(0, 20, (1000, 4), dtype=torch.long)
+    src = torch.randint(-100, 100, (1000, 4), dtype=torch.int32)
+    index = torch.randint(0, 20, (1000,), dtype=torch.long)
 
     val, arg = _ARG_OPS[op_name](src.to("mps"), index.to("mps"), dim=0, dim_size=20)
     ref_val, ref_arg = _ARG_OPS[op_name](src.cpu(), index.cpu(), dim=0, dim_size=20)
-    torch.testing.assert_close(val.cpu(), ref_val, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(val.cpu(), ref_val, rtol=0, atol=0)
     torch.testing.assert_close(arg.cpu(), ref_arg, rtol=0, atol=0)
 
 
