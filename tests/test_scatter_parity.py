@@ -200,6 +200,40 @@ def test_arg_points_to_reduced_value(op_name: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("op_name", list(_ARG_OPS))
+def test_metal_heavy_contention_ties(op_name: str) -> None:
+    """Fused Metal path: heavy contention + many exact ties, value+arg exact.
+
+    Few nodes and many integer-valued edges force thousands of collisions per
+    output cell with frequent ties -- the case where an atomic race or a bad
+    tie-break in the kernel would surface. Requires exact equality vs the CPU
+    kernel (first-occurrence tie-break).
+    """
+    torch.manual_seed(7)
+    E, F, N = 60_000, 8, 32  # ~1900 edges/node
+    src = torch.randint(-4, 5, (E, F)).float()  # integer values => many ties
+    index = torch.randint(0, N, (E,), dtype=torch.long)
+
+    val, arg = _ARG_OPS[op_name](src.to("mps"), index.to("mps"), dim=0, dim_size=N)
+    ref_val, ref_arg = _ARG_OPS[op_name](src.cpu(), index.cpu(), dim=0, dim_size=N)
+    torch.testing.assert_close(val.cpu(), ref_val, rtol=0, atol=0)
+    torch.testing.assert_close(arg.cpu(), ref_arg, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("op_name", list(_ARG_OPS))
+def test_fallback_genuine_2d_index(op_name: str) -> None:
+    """A non-broadcast 2-D index bypasses the Metal fast path and stays correct."""
+    torch.manual_seed(8)
+    src = torch.randn(1000, 4)
+    # Distinct target per (row, col): stride(1) != 0, so the kernel falls back.
+    index = torch.randint(0, 20, (1000, 4), dtype=torch.long)
+
+    val, arg = _ARG_OPS[op_name](src.to("mps"), index.to("mps"), dim=0, dim_size=20)
+    ref_val, ref_arg = _ARG_OPS[op_name](src.cpu(), index.cpu(), dim=0, dim_size=20)
+    torch.testing.assert_close(val.cpu(), ref_val, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(arg.cpu(), ref_arg, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("op_name", ["scatter_min", "scatter_max"])
 def test_cross_check_torch_scatter(op_name: str) -> None:
     """Cross-validate the MPS arg path against torch_scatter on CPU."""
