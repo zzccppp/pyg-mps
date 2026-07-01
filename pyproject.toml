@@ -1,0 +1,9 @@
+[project]
+name = "pyg-macos-mps"
+version = "0.1.0"
+description = "Staged PyTorch Geometric MPS investigation workspace"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false

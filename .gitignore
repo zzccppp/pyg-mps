@@ -1,0 +1,7 @@
+.venv*/
+.uv-cache/
+src/
+reports/*.json
+__pycache__/
+*.pyc
+.DS_Store
