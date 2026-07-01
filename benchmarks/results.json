@@ -1,0 +1,333 @@
+{
+  "meta": {
+    "torch_version": "2.12.1",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "dtype": "torch.float32",
+    "feature_dim": 64,
+    "fanout": 10,
+    "warmup": 20,
+    "iters": 100,
+    "devices": [
+      "mps",
+      "cpu"
+    ]
+  },
+  "results": [
+    {
+      "op": "scatter_sum",
+      "device": "mps",
+      "edges": 10000,
+      "nodes": 1000,
+      "ms_median": 0.7654165383428335,
+      "ms_mean": 0.8058549836277962,
+      "ms_stdev": 0.12309735712442889
+    },
+    {
+      "op": "scatter_mean",
+      "device": "mps",
+      "edges": 10000,
+      "nodes": 1000,
+      "ms_median": 0.6038958672434092,
+      "ms_mean": 0.7171945180743933,
+      "ms_stdev": 0.1911296911151699
+    },
+    {
+      "op": "scatter_max",
+      "device": "mps",
+      "edges": 10000,
+      "nodes": 1000,
+      "ms_median": 0.781249487772584,
+      "ms_mean": 0.808598268777132,
+      "ms_stdev": 0.1200652528956323
+    },
+    {
+      "op": "scatter_max_cpu_arg",
+      "device": "mps",
+      "edges": 10000,
+      "nodes": 1000,
+      "ms_median": 1.7214380204677582,
+      "ms_mean": 1.7501991894096136,
+      "ms_stdev": 0.16208489838203544
+    },
+    {
+      "op": "scatter_sum",
+      "device": "cpu",
+      "edges": 10000,
+      "nodes": 1000,
+      "ms_median": 0.3276460338383913,
+      "ms_mean": 0.3274016734212637,
+      "ms_stdev": 0.013565502841795292
+    },
+    {
+      "op": "scatter_mean",
+      "device": "cpu",
+      "edges": 10000,
+      "nodes": 1000,
+      "ms_median": 0.3645620308816433,
+      "ms_mean": 0.3642903780564666,
+      "ms_stdev": 0.02150576793613505
+    },
+    {
+      "op": "scatter_max",
+      "device": "cpu",
+      "edges": 10000,
+      "nodes": 1000,
+      "ms_median": 1.4730000402778387,
+      "ms_mean": 1.4972679363563657,
+      "ms_stdev": 0.08133738405611583
+    },
+    {
+      "op": "scatter_sum",
+      "device": "mps",
+      "edges": 50000,
+      "nodes": 5000,
+      "ms_median": 1.3303128071129322,
+      "ms_mean": 1.354998736642301,
+      "ms_stdev": 0.08255903324485445
+    },
+    {
+      "op": "scatter_mean",
+      "device": "mps",
+      "edges": 50000,
+      "nodes": 5000,
+      "ms_median": 1.3786668423563242,
+      "ms_mean": 1.4371500769630075,
+      "ms_stdev": 0.22052987269716556
+    },
+    {
+      "op": "scatter_max",
+      "device": "mps",
+      "edges": 50000,
+      "nodes": 5000,
+      "ms_median": 3.3168750815093517,
+      "ms_mean": 3.359306287020445,
+      "ms_stdev": 0.12559093379692954
+    },
+    {
+      "op": "scatter_max_cpu_arg",
+      "device": "mps",
+      "edges": 50000,
+      "nodes": 5000,
+      "ms_median": 6.91347848623991,
+      "ms_mean": 8.340529631823301,
+      "ms_stdev": 3.6553136822591252
+    },
+    {
+      "op": "scatter_sum",
+      "device": "cpu",
+      "edges": 50000,
+      "nodes": 5000,
+      "ms_median": 1.42422947101295,
+      "ms_mean": 1.4329274836927652,
+      "ms_stdev": 0.07160474676056179
+    },
+    {
+      "op": "scatter_mean",
+      "device": "cpu",
+      "edges": 50000,
+      "nodes": 5000,
+      "ms_median": 1.5364789869636297,
+      "ms_mean": 1.5656462730839849,
+      "ms_stdev": 0.10476827999500732
+    },
+    {
+      "op": "scatter_max",
+      "device": "cpu",
+      "edges": 50000,
+      "nodes": 5000,
+      "ms_median": 7.2887917049229145,
+      "ms_mean": 7.369897123426199,
+      "ms_stdev": 0.4496476098604961
+    },
+    {
+      "op": "scatter_sum",
+      "device": "mps",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 4.78914612904191,
+      "ms_mean": 4.837205014191568,
+      "ms_stdev": 0.2940514229505488
+    },
+    {
+      "op": "scatter_mean",
+      "device": "mps",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 4.905457841232419,
+      "ms_mean": 4.993757046759129,
+      "ms_stdev": 0.4274548350430862
+    },
+    {
+      "op": "scatter_max",
+      "device": "mps",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 13.152291532605886,
+      "ms_mean": 13.345933351665735,
+      "ms_stdev": 0.8820452243281899
+    },
+    {
+      "op": "scatter_max_cpu_arg",
+      "device": "mps",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 16.130104660987854,
+      "ms_mean": 16.238286262378097,
+      "ms_stdev": 1.2348239447993854
+    },
+    {
+      "op": "scatter_sum",
+      "device": "cpu",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 3.2393750734627247,
+      "ms_mean": 3.29613049980253,
+      "ms_stdev": 0.3107605805140992
+    },
+    {
+      "op": "scatter_mean",
+      "device": "cpu",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 3.1490831170231104,
+      "ms_mean": 3.1728021102026105,
+      "ms_stdev": 0.1888415882748857
+    },
+    {
+      "op": "scatter_max",
+      "device": "cpu",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 14.410104136914015,
+      "ms_mean": 14.460912887006998,
+      "ms_stdev": 0.5056077970578284
+    },
+    {
+      "op": "scatter_sum",
+      "device": "mps",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 23.24341656640172,
+      "ms_mean": 23.312902450561523,
+      "ms_stdev": 0.3391694819731819
+    },
+    {
+      "op": "scatter_mean",
+      "device": "mps",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 23.44966633245349,
+      "ms_mean": 23.490733257494867,
+      "ms_stdev": 0.3803500494747612
+    },
+    {
+      "op": "scatter_max",
+      "device": "mps",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 76.03774988092482,
+      "ms_mean": 76.52113374322653,
+      "ms_stdev": 1.41537920469814
+    },
+    {
+      "op": "scatter_max_cpu_arg",
+      "device": "mps",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 88.05902092717588,
+      "ms_mean": 89.07364035025239,
+      "ms_stdev": 3.296331079708537
+    },
+    {
+      "op": "scatter_sum",
+      "device": "cpu",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 21.55835391022265,
+      "ms_mean": 22.804298298433423,
+      "ms_stdev": 2.8977954736950715
+    },
+    {
+      "op": "scatter_mean",
+      "device": "cpu",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 27.610187651589513,
+      "ms_mean": 26.348944697529078,
+      "ms_stdev": 2.6763973579166467
+    },
+    {
+      "op": "scatter_max",
+      "device": "cpu",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 86.93060395307839,
+      "ms_mean": 87.43308670353144,
+      "ms_stdev": 3.431486338543175
+    },
+    {
+      "op": "scatter_sum",
+      "device": "mps",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 60.29825005680323,
+      "ms_mean": 60.35177999641746,
+      "ms_stdev": 0.555175480885516
+    },
+    {
+      "op": "scatter_mean",
+      "device": "mps",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 61.00787501782179,
+      "ms_mean": 61.094052069820464,
+      "ms_stdev": 0.49935275864492534
+    },
+    {
+      "op": "scatter_max",
+      "device": "mps",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 184.25985402427614,
+      "ms_mean": 185.0818583695218,
+      "ms_stdev": 3.013017047907473
+    },
+    {
+      "op": "scatter_max_cpu_arg",
+      "device": "mps",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 214.24058359116316,
+      "ms_mean": 214.89543091040105,
+      "ms_stdev": 8.657505016284768
+    },
+    {
+      "op": "scatter_sum",
+      "device": "cpu",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 85.66654124297202,
+      "ms_mean": 86.85570957604796,
+      "ms_stdev": 6.906506196006275
+    },
+    {
+      "op": "scatter_mean",
+      "device": "cpu",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 99.71374995075166,
+      "ms_mean": 100.02231119666249,
+      "ms_stdev": 11.809180462499825
+    },
+    {
+      "op": "scatter_max",
+      "device": "cpu",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 205.9157295152545,
+      "ms_mean": 207.68811414483935,
+      "ms_stdev": 5.624180488791249
+    }
+  ]
+}

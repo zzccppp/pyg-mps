@@ -75,6 +75,20 @@ Direct-shell MPS results on this host:
 See [docs/findings.md](docs/findings.md) for the evidence trail and
 [docs/roadmap.md](docs/roadmap.md) for the porting plan.
 
+## Benchmarks
+
+[benchmarks/REPORT.md](benchmarks/REPORT.md) quantifies the native MPS scatter
+kernels. Headlines on this host (macOS 26.5.1, Apple Silicon, `torch==2.12.1`):
+
+- The on-device int32 argmin/argmax path is **up to ~2.2× faster** than the
+  earlier MPS-value/CPU-arg approach at 10k–50k edges, and ~16% faster at 1M
+  edges, by removing a per-call CPU round-trip.
+- Native MPS `scatter_sum`/`scatter_mean` overtake CPU past ~500k edges
+  (1.4–1.6× at 1M) but lose on small graphs — native kernels are worth shipping,
+  but MPS is not automatically faster at every size.
+
+Regenerate with `./scripts/uv_stage.sh benchmark` then `./scripts/uv_stage.sh report`.
+
 ## Staged Commands
 
 Create the clean Python 3.12 environment:

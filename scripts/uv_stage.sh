@@ -184,6 +184,16 @@ case "${stage}" in
     "${venv_python}" -c "import pytest" 2>/dev/null || uv pip install pytest
     "${venv_python}" -m pytest tests/test_scatter_parity.py -v
     ;;
+  benchmark)
+    ensure_venv
+    warn_sandbox
+    "${venv_python}" scripts/benchmark_scatter.py
+    ;;
+  report)
+    ensure_venv
+    "${venv_python}" -c "import matplotlib" 2>/dev/null || uv pip install matplotlib
+    "${venv_python}" scripts/plot_benchmarks.py
+    ;;
   example)
     ensure_venv
     "${venv_python}" examples/gcn_mps_smoke.py
@@ -251,6 +261,8 @@ Known stages:
   extensions-cpu
   extensions-mps
   parity
+  benchmark
+  report
   example
   list
   summary
