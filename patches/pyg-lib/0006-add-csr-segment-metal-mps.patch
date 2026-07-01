@@ -1,0 +1,317 @@
+diff --git a/pyg_lib/csrc/ops/mps/segment_csr_metal.mm b/pyg_lib/csrc/ops/mps/segment_csr_metal.mm
+new file mode 100644
+index 0000000..b555ddd
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/segment_csr_metal.mm
+@@ -0,0 +1,311 @@
++// Native MPS support for the CSR segment family via a dedicated Metal kernel.
++//
++// A CSR segment reduction assigns one output row per compressed range
++// `[indptr[n], indptr[n+1])`. Unlike the COO/scatter path there is no
++// contention: each output cell is owned by exactly one thread, which scans its
++// contiguous source range sequentially. So this needs no atomics and no value
++// packing -- it directly compares/accumulates promoted-to-float values and, for
++// min/max, tracks the absolute source index (first occurrence on ties), matching
++// the CPU kernel. Empty segments produce value 0 and arg `E = src.size(dim)`.
++//
++// The kernel covers the hot path (1-D `indptr`, float32/float16/bfloat16). Other
++// cases (multi-dim indptr, a caller-provided `out`, other dtypes, or tensors too
++// large for the 32-bit counters) fall back to the CPU kernel.
++
++#include "../segment_csr.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <torch/mps.h>
++
++#include <limits>
++#include <tuple>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++static const char* kShaderSrc = R"METAL(
++#include <metal_stdlib>
++using namespace metal;
++
++inline float to_float(float v)  { return v; }
++inline float to_float(half v)   { return float(v); }
++inline float to_float(ushort v) { return as_type<float>(uint(v) << 16); }
++inline void store_out(device float* p, uint i, float v)  { p[i] = v; }
++inline void store_out(device half* p, uint i, float v)   { p[i] = half(v); }
++inline void store_out(device ushort* p, uint i, float v) { p[i] = ushort(as_type<uint>(v) >> 16); }
++
++// Per-(row, feature) contiguous reduction. is_mean divides by the count.
++template <typename T>
++inline void seg_sum_impl(device const T* src, device const long* indptr,
++                         device T* out, uint N, uint INNER, uint is_mean,
++                         uint gid) {
++    if (gid >= N * INNER) return;
++    uint n = gid / INNER;
++    uint j = gid % INNER;
++    long start = indptr[n], end = indptr[n + 1];
++    float acc = 0.0f;
++    for (long e = start; e < end; ++e) acc += to_float(src[(uint)e * INNER + j]);
++    if (is_mean != 0u && end > start) acc /= float(end - start);
++    store_out(out, gid, acc);
++}
++
++// Per-(row, feature) min/max with absolute-index arg (first occurrence on ties).
++template <typename T>
++inline void seg_arg_impl(device const T* src, device const long* indptr,
++                         device T* out, device long* arg, uint N, uint INNER,
++                         uint E, uint is_min, uint gid) {
++    if (gid >= N * INNER) return;
++    uint n = gid / INNER;
++    uint j = gid % INNER;
++    long start = indptr[n], end = indptr[n + 1];
++    if (end <= start) { store_out(out, gid, 0.0f); arg[gid] = (long)E; return; }
++    float best = to_float(src[(uint)start * INNER + j]);
++    long besti = start;
++    for (long e = start + 1; e < end; ++e) {
++        float v = to_float(src[(uint)e * INNER + j]);
++        bool better = (is_min != 0u) ? (v < best) : (v > best);
++        if (better) { best = v; besti = e; }
++    }
++    store_out(out, gid, best);
++    arg[gid] = besti;
++}
++
++#define SUM_K(NAME, T)                                       \
++  kernel void NAME(device const T* src [[buffer(0)]],        \
++                   device const long* indptr [[buffer(1)]],  \
++                   device T* out [[buffer(2)]],              \
++                   constant uint& N [[buffer(3)]],           \
++                   constant uint& INNER [[buffer(4)]],       \
++                   constant uint& is_mean [[buffer(5)]],     \
++                   uint gid [[thread_position_in_grid]]) {   \
++    seg_sum_impl(src, indptr, out, N, INNER, is_mean, gid);  \
++  }
++#define ARG_K(NAME, T)                                       \
++  kernel void NAME(device const T* src [[buffer(0)]],        \
++                   device const long* indptr [[buffer(1)]],  \
++                   device T* out [[buffer(2)]],              \
++                   device long* arg [[buffer(3)]],           \
++                   constant uint& N [[buffer(4)]],           \
++                   constant uint& INNER [[buffer(5)]],       \
++                   constant uint& E [[buffer(6)]],           \
++                   constant uint& is_min [[buffer(7)]],      \
++                   uint gid [[thread_position_in_grid]]) {   \
++    seg_arg_impl(src, indptr, out, arg, N, INNER, E, is_min, gid); \
++  }
++
++SUM_K(seg_sum_f32, float)
++SUM_K(seg_sum_f16, half)
++SUM_K(seg_sum_bf16, ushort)
++ARG_K(seg_arg_f32, float)
++ARG_K(seg_arg_f16, half)
++ARG_K(seg_arg_bf16, ushort)
++)METAL";
++
++constexpr int kNumDtypes = 3;
++
++struct MetalSeg {
++  id<MTLComputePipelineState> sum[kNumDtypes] = {nil, nil, nil};
++  id<MTLComputePipelineState> arg[kNumDtypes] = {nil, nil, nil};
++  bool ok = false;
++};
++
++id<MTLComputePipelineState> make_pso(id<MTLDevice> dev, id<MTLLibrary> lib,
++                                     NSString* name) {
++  NSError* err = nil;
++  id<MTLFunction> fn = [lib newFunctionWithName:name];
++  if (!fn) return nil;
++  return [dev newComputePipelineStateWithFunction:fn error:&err];
++}
++
++const MetalSeg& metal_seg() {
++  static MetalSeg state = [] {
++    MetalSeg s;
++    @autoreleasepool {
++      id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
++      if (!dev) return s;
++      NSError* err = nil;
++      id<MTLLibrary> lib = [dev
++          newLibraryWithSource:[NSString stringWithUTF8String:kShaderSrc]
++                       options:nil
++                         error:&err];
++      if (!lib) return s;
++      NSString* sum_n[kNumDtypes] = {@"seg_sum_f32", @"seg_sum_f16", @"seg_sum_bf16"};
++      NSString* arg_n[kNumDtypes] = {@"seg_arg_f32", @"seg_arg_f16", @"seg_arg_bf16"};
++      for (int i = 0; i < kNumDtypes; ++i) {
++        s.sum[i] = make_pso(dev, lib, sum_n[i]);
++        s.arg[i] = make_pso(dev, lib, arg_n[i]);
++        if (!s.sum[i] || !s.arg[i]) return s;
++      }
++      s.ok = true;
++    }
++    return s;
++  }();
++  return state;
++}
++
++int dtype_index(at::ScalarType t) {
++  switch (t) {
++    case at::kFloat: return 0;
++    case at::kHalf: return 1;
++    case at::kBFloat16: return 2;
++    default: return -1;
++  }
++}
++
++static inline id<MTLBuffer> mtl_buffer(const at::Tensor& t) {
++  return __builtin_bit_cast(id<MTLBuffer>, t.storage().data());
++}
++static inline NSUInteger byte_offset(const at::Tensor& t) {
++  return (NSUInteger)(t.storage_offset() * t.element_size());
++}
++
++bool csr_eligible(const at::Tensor& src, const at::Tensor& indptr,
++                  const std::optional<at::Tensor>& out) {
++  const int64_t u32 = std::numeric_limits<uint32_t>::max();
++  return metal_seg().ok && !out.has_value() && indptr.dim() == 1 &&
++         indptr.scalar_type() == at::kLong && dtype_index(src.scalar_type()) >= 0 &&
++         src.numel() <= u32;
++}
++
++// INNER = product of dims after the reduction dim (`indptr.dim() - 1`).
++int64_t inner_size(const at::Tensor& src, int64_t dim) {
++  int64_t inner = 1;
++  for (int64_t i = dim + 1; i < src.dim(); ++i) inner *= src.size(i);
++  return inner;
++}
++
++at::Tensor seg_csr_sum_metal(const at::Tensor& src, const at::Tensor& indptr,
++                             uint32_t is_mean) {
++  const MetalSeg& m = metal_seg();
++  auto src_c = src.contiguous();
++  auto indptr_c = indptr.contiguous();
++  const uint32_t N = (uint32_t)(indptr_c.size(0) - 1);
++  const uint32_t INNER = (uint32_t)inner_size(src_c, 0);
++  auto sizes = src_c.sizes().vec();
++  sizes[0] = (int64_t)N;
++  auto out = at::empty(sizes, src_c.options());
++  const uint32_t total = N * INNER;
++  auto pso = m.sum[dtype_index(src_c.scalar_type())];
++  @autoreleasepool {
++    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
++    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
++      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++      [enc setComputePipelineState:pso];
++      [enc setBuffer:mtl_buffer(src_c) offset:byte_offset(src_c) atIndex:0];
++      [enc setBuffer:mtl_buffer(indptr_c) offset:byte_offset(indptr_c) atIndex:1];
++      [enc setBuffer:mtl_buffer(out) offset:0 atIndex:2];
++      [enc setBytes:&N length:sizeof(N) atIndex:3];
++      [enc setBytes:&INNER length:sizeof(INNER) atIndex:4];
++      [enc setBytes:&is_mean length:sizeof(is_mean) atIndex:5];
++      NSUInteger tg = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup,
++                          (NSUInteger)total);
++      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
++          threadsPerThreadgroup:MTLSizeMake(MAX(tg, (NSUInteger)1), 1, 1)];
++      [enc endEncoding];
++      torch::mps::commit();
++    });
++  }
++  return out;
++}
++
++std::tuple<at::Tensor, at::Tensor> seg_csr_arg_metal(const at::Tensor& src,
++                                                     const at::Tensor& indptr,
++                                                     uint32_t is_min) {
++  const MetalSeg& m = metal_seg();
++  auto src_c = src.contiguous();
++  auto indptr_c = indptr.contiguous();
++  const uint32_t N = (uint32_t)(indptr_c.size(0) - 1);
++  const uint32_t INNER = (uint32_t)inner_size(src_c, 0);
++  const uint32_t E = (uint32_t)src_c.size(0);
++  auto sizes = src_c.sizes().vec();
++  sizes[0] = (int64_t)N;
++  auto out = at::empty(sizes, src_c.options());
++  auto arg = at::empty(sizes, src_c.options().dtype(at::kLong));
++  const uint32_t total = N * INNER;
++  auto pso = m.arg[dtype_index(src_c.scalar_type())];
++  @autoreleasepool {
++    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
++    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
++      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++      [enc setComputePipelineState:pso];
++      [enc setBuffer:mtl_buffer(src_c) offset:byte_offset(src_c) atIndex:0];
++      [enc setBuffer:mtl_buffer(indptr_c) offset:byte_offset(indptr_c) atIndex:1];
++      [enc setBuffer:mtl_buffer(out) offset:0 atIndex:2];
++      [enc setBuffer:mtl_buffer(arg) offset:0 atIndex:3];
++      [enc setBytes:&N length:sizeof(N) atIndex:4];
++      [enc setBytes:&INNER length:sizeof(INNER) atIndex:5];
++      [enc setBytes:&E length:sizeof(E) atIndex:6];
++      [enc setBytes:&is_min length:sizeof(is_min) atIndex:7];
++      NSUInteger tg = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup,
++                          (NSUInteger)total);
++      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
++          threadsPerThreadgroup:MTLSizeMake(MAX(tg, (NSUInteger)1), 1, 1)];
++      [enc endEncoding];
++      torch::mps::commit();
++    });
++  }
++  return std::make_tuple(out, arg);
++}
++
++// ---- registered ops (Metal fast path + CPU-assisted fallback) --------------
++
++at::Tensor segment_sum_csr_mps(const at::Tensor& src, const at::Tensor& indptr,
++                               const std::optional<at::Tensor>& out) {
++  if (csr_eligible(src, indptr, out)) return seg_csr_sum_metal(src, indptr, 0u);
++  return segment_sum_csr(src.cpu(), indptr.cpu(),
++                         out.has_value() ? std::optional<at::Tensor>(out->cpu())
++                                         : std::nullopt)
++      .to(src.device());
++}
++
++at::Tensor segment_mean_csr_mps(const at::Tensor& src, const at::Tensor& indptr,
++                                const std::optional<at::Tensor>& out) {
++  if (csr_eligible(src, indptr, out)) return seg_csr_sum_metal(src, indptr, 1u);
++  return segment_mean_csr(src.cpu(), indptr.cpu(),
++                          out.has_value() ? std::optional<at::Tensor>(out->cpu())
++                                          : std::nullopt)
++      .to(src.device());
++}
++
++std::tuple<at::Tensor, at::Tensor> segment_min_csr_mps(
++    const at::Tensor& src, const at::Tensor& indptr,
++    const std::optional<at::Tensor>& out) {
++  if (csr_eligible(src, indptr, out)) return seg_csr_arg_metal(src, indptr, 1u);
++  auto r = segment_min_csr(src.cpu(), indptr.cpu(),
++                           out.has_value() ? std::optional<at::Tensor>(out->cpu())
++                                           : std::nullopt);
++  return std::make_tuple(std::get<0>(r).to(src.device()),
++                         std::get<1>(r).to(src.device()));
++}
++
++std::tuple<at::Tensor, at::Tensor> segment_max_csr_mps(
++    const at::Tensor& src, const at::Tensor& indptr,
++    const std::optional<at::Tensor>& out) {
++  if (csr_eligible(src, indptr, out)) return seg_csr_arg_metal(src, indptr, 0u);
++  auto r = segment_max_csr(src.cpu(), indptr.cpu(),
++                           out.has_value() ? std::optional<at::Tensor>(out->cpu())
++                                           : std::nullopt);
++  return std::make_tuple(std::get<0>(r).to(src.device()),
++                         std::get<1>(r).to(src.device()));
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_sum_csr"),
++         TORCH_FN(segment_sum_csr_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_mean_csr"),
++         TORCH_FN(segment_mean_csr_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_min_csr"),
++         TORCH_FN(segment_min_csr_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_max_csr"),
++         TORCH_FN(segment_max_csr_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg

@@ -73,3 +73,56 @@ def test_gather_coo_parity() -> None:
     ref = ops.gather_coo(src.cpu(), index.cpu())
     assert got.device.type == "mps"
     torch.testing.assert_close(got.cpu(), ref, rtol=0, atol=0)
+
+
+# --- CSR family (dedicated Metal per-row kernel) ---------------------------
+
+def _indptr(num_edges: int, num_segments: int) -> torch.Tensor:
+    """CSR row pointers with some empty segments."""
+    counts = torch.bincount(
+        torch.randint(0, num_segments, (num_edges,)), minlength=num_segments
+    )
+    return torch.cat([counts.new_zeros(1), counts.cumsum(0)]).long()
+
+
+_VALUE_CSR = {"segment_sum_csr": ops.segment_sum_csr, "segment_mean_csr": ops.segment_mean_csr}
+_ARG_CSR = {"segment_min_csr": ops.segment_min_csr, "segment_max_csr": ops.segment_max_csr}
+
+
+@pytest.mark.parametrize("op_name", list(_VALUE_CSR))
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_segment_value_csr_parity(op_name: str, dtype: torch.dtype) -> None:
+    torch.manual_seed(3)
+    indptr = _indptr(20_000, 300)
+    src = (torch.randn(int(indptr[-1]), 16) * 0.5).to(dtype)
+    op = _VALUE_CSR[op_name]
+    got = op(src.to("mps"), indptr.to("mps"))
+    ref = op(src.cpu(), indptr.cpu())
+    assert got.device.type == "mps"
+    tol = {"rtol": 2e-2, "atol": 1e-2} if dtype != torch.float32 else {"rtol": 1e-4, "atol": 1e-3}
+    torch.testing.assert_close(got.float().cpu(), ref.float(), **tol)
+
+
+@pytest.mark.parametrize("op_name", list(_ARG_CSR))
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_segment_arg_csr_parity(op_name: str, dtype: torch.dtype) -> None:
+    """Empty segments + heavy ties -> exact value+arg (absolute idx) vs CPU."""
+    torch.manual_seed(4)
+    indptr = _indptr(40_000, 200)
+    src = torch.randint(-4, 5, (int(indptr[-1]), 8)).to(dtype)
+    op = _ARG_CSR[op_name]
+    val, arg = op(src.to("mps"), indptr.to("mps"))
+    ref_val, ref_arg = op(src.cpu(), indptr.cpu())
+    assert val.dtype == dtype and arg.device.type == "mps"
+    torch.testing.assert_close(val.cpu(), ref_val, rtol=0, atol=0)
+    torch.testing.assert_close(arg.cpu(), ref_arg, rtol=0, atol=0)
+
+
+def test_gather_csr_parity() -> None:
+    torch.manual_seed(5)
+    indptr = _indptr(20_000, 300)
+    src = torch.randn(300, 16)
+    got = ops.gather_csr(src.to("mps"), indptr.to("mps"))
+    ref = ops.gather_csr(src.cpu(), indptr.cpu())
+    assert got.device.type == "mps"
+    torch.testing.assert_close(got.cpu(), ref, rtol=0, atol=0)

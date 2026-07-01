@@ -1,9 +1,9 @@
 diff --git a/pyg_lib/csrc/ops/mps/segment_coo_kernel.cpp b/pyg_lib/csrc/ops/mps/segment_coo_kernel.cpp
 new file mode 100644
-index 0000000..3de0b1c
+index 0000000..5d457f6
 --- /dev/null
 +++ b/pyg_lib/csrc/ops/mps/segment_coo_kernel.cpp
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,131 @@
 +// Native MPS support for the COO segment/gather family.
 +//
 +// A COO segment reduction is exactly a scatter along `dim = index.dim() - 1`:
@@ -17,6 +17,7 @@ index 0000000..3de0b1c
 +
 +#include "../scatter.h"
 +#include "../segment_coo.h"
++#include "../segment_csr.h"
 +#include "../utils.h"
 +
 +#include <ATen/ATen.h>
@@ -90,6 +91,33 @@ index 0000000..3de0b1c
 +  return result;
 +}
 +
++// out[e, ...] = src[row(e), ...], where row(e) is the CSR row that contains
++// position e. Building the per-position row index (repeat_interleave of the
++// segment lengths) reduces this to a native index_select. Falls back to CPU for
++// a multi-dim indptr.
++at::Tensor gather_csr_mps(const at::Tensor& src,
++                          const at::Tensor& indptr,
++                          const std::optional<at::Tensor>& out) {
++  if (indptr.dim() != 1) {
++    auto res = gather_csr(src.cpu(), indptr.cpu(),
++                          out.has_value()
++                              ? std::optional<at::Tensor>(out->cpu())
++                              : std::nullopt)
++                   .to(src.device());
++    return res;
++  }
++  const int64_t N = indptr.size(0) - 1;
++  auto ip = indptr.contiguous();
++  auto counts = ip.slice(0, 1, N + 1) - ip.slice(0, 0, N);       // [N]
++  auto row = at::arange(N, ip.options()).repeat_interleave(counts);  // [E]
++  auto result = src.index_select(0, row);
++  if (out.has_value()) {
++    out.value().copy_(result);
++    return out.value();
++  }
++  return result;
++}
++
 +}  // namespace
 +
 +TORCH_LIBRARY_IMPL(pyg, MPS, m) {
@@ -102,6 +130,7 @@ index 0000000..3de0b1c
 +  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_max_coo"),
 +         TORCH_FN(segment_max_coo_mps));
 +  m.impl(TORCH_SELECTIVE_NAME("pyg::gather_coo"), TORCH_FN(gather_coo_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::gather_csr"), TORCH_FN(gather_csr_mps));
 +}
 +
 +}  // namespace ops
