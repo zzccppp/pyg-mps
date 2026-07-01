@@ -32,10 +32,10 @@ index d2522ff..d35d2fa 100644
    target_link_libraries(${PROJECT_NAME} PRIVATE OpenMP::OpenMP_CXX)
 diff --git a/pyg_lib/csrc/ops/mps/scatter_metal.mm b/pyg_lib/csrc/ops/mps/scatter_metal.mm
 new file mode 100644
-index 0000000..df846fc
+index 0000000..8ceac9c
 --- /dev/null
 +++ b/pyg_lib/csrc/ops/mps/scatter_metal.mm
-@@ -0,0 +1,439 @@
+@@ -0,0 +1,502 @@
 +// Fused single-pass scatter_min / scatter_max for the MPS backend.
 +//
 +// The tensor-op MPS path computes the reduced value and its arg index with five
@@ -50,10 +50,11 @@ index 0000000..df846fc
 +// matches the CPU kernel's first-match semantics. A cheap second kernel unpacks
 +// the 64-bit keys into the value and arg tensors.
 +//
-+// This requires 64-bit atomics (Metal 3.1+, Apple GPU family 8/9). The kernel is
-+// used only for the message-passing hot path -- 2-D float32 `src`, `dim == 0`,
-+// and a column-broadcast `index` (what PyG produces from a 1-D edge index). All
-+// other shapes/dtypes fall back to the portable int32 tensor-op implementation.
++// This requires 64-bit atomics (Metal 3.1+, Apple GPU family 8/9). The kernel
++// handles an arbitrary `dim` and rank by viewing `src` as [OUTER, D, INNER], and
++// both a broadcast index (from a 1-D edge index) and a genuine per-element index,
++// for float32/float16/bfloat16. Only a caller-provided `out` (include_self) and
++// tensors too large for the 32-bit counters fall back to the int32 tensor path.
 +
 +#include "../scatter.h"
 +
@@ -65,6 +66,7 @@ index 0000000..df846fc
 +#include <torch/mps.h>
 +
 +#include <limits>
++#include <optional>
 +#include <tuple>
 +#include <vector>
 +
@@ -157,55 +159,69 @@ index 0000000..df846fc
 +inline void store_out(device half* p, uint i, float v)   { p[i] = half(v); }
 +inline void store_out(device ushort* p, uint i, float v) { p[i] = ushort(as_type<uint>(v) >> 16); }
 +
-+// One atomic per (e, f): pack the sortable value and ~e, then atomic_max into
-+// the target cell. For min we store ~f2s so the smallest value yields the
-+// largest key. Empty cells stay 0 (smaller than any real key).
++// General scatter along an arbitrary dim, viewing src as [OUTER, D, INNER]
++// (OUTER = product of dims before dim, D = size along dim, INNER = product of
++// dims after dim). Output is [OUTER, DIMSZ, INNER]. For element gid with
++// coordinates (o, k, j), the target cell is (o*DIMSZ + n)*INNER + j where n is
++// the scatter index; the arg index recorded is k (the position along dim).
++// `idx_mode` 0 reads a length-D broadcast index (idx[k]); mode 1 reads a full
++// per-element index (idx[gid]). Pack the sortable value with ~k and atomic_max;
++// for min we store ~f2s so the smallest value yields the largest key.
 +template <typename T>
 +inline void pack_impl(device const T* src, device const long* idx,
-+                      device atomic_ulong* keys, uint E, uint F, uint is_min,
-+                      uint gid) {
-+    if (gid >= E * F) return;
-+    uint e = gid / F;
-+    uint f = gid % F;
++                      device atomic_ulong* keys, uint OUTER, uint D, uint INNER,
++                      uint DIMSZ, uint is_min, uint idx_mode, uint gid) {
++    if (gid >= OUTER * D * INNER) return;
++    uint dinner = D * INNER;
++    uint o = gid / dinner;
++    uint rem = gid % dinner;
++    uint k = rem / INNER;
++    uint j = rem % INNER;
++    long n = (idx_mode == 0u) ? idx[k] : idx[gid];
 +    uint vt = f2s(to_float(src[gid]));
 +    if (is_min != 0u) vt = ~vt;
-+    ulong packed = ((ulong)vt << 32) | (ulong)(~e);
-+    atomic_max_explicit(&keys[(uint)idx[e] * F + f], packed, memory_order_relaxed);
++    ulong packed = ((ulong)vt << 32) | (ulong)(~k);
++    uint cell = (o * DIMSZ + (uint)n) * INNER + j;
++    atomic_max_explicit(&keys[cell], packed, memory_order_relaxed);
 +}
 +
-+// Unpack keys -> value + arg. Empty cells (key high bits == 0) become (0, E).
++// Unpack keys -> value + arg. Empty cells (key high bits == 0) become value 0
++// and arg D (the sentinel src.size(dim)).
 +template <typename OutT>
 +inline void unpack_impl(device const ulong* keys, device OutT* out,
-+                        device long* arg, uint NF, uint E, uint is_min,
++                        device long* arg, uint NF, uint D, uint is_min,
 +                        uint gid) {
 +    if (gid >= NF) return;
 +    ulong key = keys[gid];
 +    uint vt = (uint)(key >> 32);
-+    if (vt == 0u) { store_out(out, gid, 0.0f); arg[gid] = (long)E; return; }
++    if (vt == 0u) { store_out(out, gid, 0.0f); arg[gid] = (long)D; return; }
 +    uint s = (is_min != 0u) ? ~vt : vt;
 +    store_out(out, gid, s2f(s));
 +    arg[gid] = (long)(~((uint)(key & 0xFFFFFFFFu)));
 +}
 +
-+#define PACK_KERNEL(NAME, T)                              \
-+  kernel void NAME(device const T* src [[buffer(0)]],     \
-+                   device const long* idx [[buffer(1)]],  \
++#define PACK_KERNEL(NAME, T)                                \
++  kernel void NAME(device const T* src [[buffer(0)]],       \
++                   device const long* idx [[buffer(1)]],    \
 +                   device atomic_ulong* keys [[buffer(2)]], \
-+                   constant uint& E [[buffer(3)]],         \
-+                   constant uint& F [[buffer(4)]],         \
-+                   constant uint& is_min [[buffer(5)]],    \
-+                   uint gid [[thread_position_in_grid]]) { \
-+    pack_impl(src, idx, keys, E, F, is_min, gid);          \
++                   constant uint& OUTER [[buffer(3)]],       \
++                   constant uint& D [[buffer(4)]],           \
++                   constant uint& INNER [[buffer(5)]],       \
++                   constant uint& DIMSZ [[buffer(6)]],       \
++                   constant uint& is_min [[buffer(7)]],      \
++                   constant uint& idx_mode [[buffer(8)]],    \
++                   uint gid [[thread_position_in_grid]]) {   \
++    pack_impl(src, idx, keys, OUTER, D, INNER, DIMSZ, is_min, idx_mode, gid); \
 +  }
-+#define UNPACK_KERNEL(NAME, T)                            \
++#define UNPACK_KERNEL(NAME, T)                              \
 +  kernel void NAME(device const ulong* keys [[buffer(0)]], \
-+                   device T* out [[buffer(1)]],            \
-+                   device long* arg [[buffer(2)]],         \
-+                   constant uint& NF [[buffer(3)]],        \
-+                   constant uint& E [[buffer(4)]],         \
-+                   constant uint& is_min [[buffer(5)]],    \
-+                   uint gid [[thread_position_in_grid]]) { \
-+    unpack_impl(keys, out, arg, NF, E, is_min, gid);       \
++                   device T* out [[buffer(1)]],             \
++                   device long* arg [[buffer(2)]],          \
++                   constant uint& NF [[buffer(3)]],          \
++                   constant uint& D [[buffer(4)]],           \
++                   constant uint& is_min [[buffer(5)]],      \
++                   uint gid [[thread_position_in_grid]]) {   \
++    unpack_impl(keys, out, arg, NF, D, is_min, gid);         \
 +  }
 +
 +PACK_KERNEL(scatter_pack_f32, float)
@@ -284,29 +300,59 @@ index 0000000..df846fc
 +  return (NSUInteger)(t.storage_offset() * t.element_size());
 +}
 +
-+// Fused Metal fast path. Preconditions (checked by the caller): src is 2-D
-+// contiguous float32, dim == 0, index is a column-broadcast [E, F] tensor, and
-+// no `out` was provided.
-+std::tuple<at::Tensor, at::Tensor> scatter_metal_fast(const at::Tensor& src,
-+                                                      const at::Tensor& index,
-+                                                      int64_t dim_size,
-+                                                      uint32_t is_min,
-+                                                      int dtype_idx) {
++// Extract the length-D index vector from a fully stride-0-broadcast index
++// (an index that varies only along `dim`). Returns a contiguous [D] tensor.
++at::Tensor broadcast_index_vector(const at::Tensor& index, int64_t dim) {
++  auto v = index.movedim(dim, 0);
++  while (v.dim() > 1) {
++    v = v.select(1, 0);
++  }
++  return v.contiguous();
++}
++
++// Fused Metal path for a general `dim`. Views src as [OUTER, D, INNER] and
++// scatters into out [OUTER, DIMSZ, INNER]. Preconditions (checked by caller):
++// src dtype in {f32,f16,bf16}, no `out` provided, index dtype long with
++// index.sizes() == src.sizes(), and the size guards in `metal_eligible` hold.
++std::tuple<at::Tensor, at::Tensor> scatter_metal_general(const at::Tensor& src,
++                                                         const at::Tensor& index,
++                                                         int64_t dim,
++                                                         int64_t dim_size,
++                                                         uint32_t is_min,
++                                                         int dtype_idx) {
 +  const MetalScatter& m = metal_scatter();
 +  id<MTLComputePipelineState> pack_pso = m.pack[dtype_idx];
 +  id<MTLComputePipelineState> unpack_pso = m.unpack[dtype_idx];
 +  auto src_c = src.contiguous();
-+  // Column-broadcast index -> one target per row (length E).
-+  auto idx_row = index.select(1, 0).contiguous();
-+  const uint32_t E = (uint32_t)src_c.size(0);
-+  const uint32_t F = (uint32_t)src_c.size(1);
-+  const uint32_t NF = (uint32_t)(dim_size * (int64_t)F);
 +
-+  auto keys = at::zeros({dim_size, (int64_t)F}, src_c.options().dtype(at::kLong));
-+  auto out = at::empty({dim_size, (int64_t)F}, src_c.options());
-+  auto arg = at::empty({dim_size, (int64_t)F}, src_c.options().dtype(at::kLong));
++  const int64_t D = src_c.size(dim);
++  int64_t outer64 = 1, inner64 = 1;
++  for (int64_t i = 0; i < dim; ++i) outer64 *= src_c.size(i);
++  for (int64_t i = dim + 1; i < src_c.dim(); ++i) inner64 *= src_c.size(i);
 +
-+  const uint32_t total = E * F;
++  // Broadcast index (varies only along `dim`) -> length-D vector; otherwise use
++  // the full per-element index. Detect via strides being 0 on all other dims.
++  bool broadcast = true;
++  for (int64_t i = 0; i < index.dim(); ++i) {
++    if (i != dim && index.stride(i) != 0) { broadcast = false; break; }
++  }
++  at::Tensor idx_buf =
++      broadcast ? broadcast_index_vector(index, dim) : index.contiguous();
++  const uint32_t idx_mode = broadcast ? 0u : 1u;
++
++  auto out_sizes = src_c.sizes().vec();
++  out_sizes[dim] = dim_size;
++  auto keys = at::zeros(out_sizes, src_c.options().dtype(at::kLong));
++  auto out = at::empty(out_sizes, src_c.options());
++  auto arg = at::empty(out_sizes, src_c.options().dtype(at::kLong));
++
++  const uint32_t OUTER = (uint32_t)outer64;
++  const uint32_t Du = (uint32_t)D;
++  const uint32_t INNER = (uint32_t)inner64;
++  const uint32_t DIMSZ = (uint32_t)dim_size;
++  const uint32_t total = (uint32_t)(outer64 * D * inner64);
++  const uint32_t NF = (uint32_t)(outer64 * dim_size * inner64);
++
 +  @autoreleasepool {
 +    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
 +    dispatch_queue_t q = torch::mps::get_dispatch_queue();
@@ -315,11 +361,14 @@ index 0000000..df846fc
 +
 +      [enc setComputePipelineState:pack_pso];
 +      [enc setBuffer:mtl_buffer(src_c) offset:byte_offset(src_c) atIndex:0];
-+      [enc setBuffer:mtl_buffer(idx_row) offset:byte_offset(idx_row) atIndex:1];
++      [enc setBuffer:mtl_buffer(idx_buf) offset:byte_offset(idx_buf) atIndex:1];
 +      [enc setBuffer:mtl_buffer(keys) offset:0 atIndex:2];
-+      [enc setBytes:&E length:sizeof(E) atIndex:3];
-+      [enc setBytes:&F length:sizeof(F) atIndex:4];
-+      [enc setBytes:&is_min length:sizeof(is_min) atIndex:5];
++      [enc setBytes:&OUTER length:sizeof(OUTER) atIndex:3];
++      [enc setBytes:&Du length:sizeof(Du) atIndex:4];
++      [enc setBytes:&INNER length:sizeof(INNER) atIndex:5];
++      [enc setBytes:&DIMSZ length:sizeof(DIMSZ) atIndex:6];
++      [enc setBytes:&is_min length:sizeof(is_min) atIndex:7];
++      [enc setBytes:&idx_mode length:sizeof(idx_mode) atIndex:8];
 +      NSUInteger tg_pack =
 +          MIN((NSUInteger)pack_pso.maxTotalThreadsPerThreadgroup, (NSUInteger)total);
 +      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
@@ -330,7 +379,7 @@ index 0000000..df846fc
 +      [enc setBuffer:mtl_buffer(out) offset:0 atIndex:1];
 +      [enc setBuffer:mtl_buffer(arg) offset:0 atIndex:2];
 +      [enc setBytes:&NF length:sizeof(NF) atIndex:3];
-+      [enc setBytes:&E length:sizeof(E) atIndex:4];
++      [enc setBytes:&Du length:sizeof(Du) atIndex:4];
 +      [enc setBytes:&is_min length:sizeof(is_min) atIndex:5];
 +      NSUInteger tg_un =
 +          MIN((NSUInteger)unpack_pso.maxTotalThreadsPerThreadgroup, (NSUInteger)NF);
@@ -408,16 +457,32 @@ index 0000000..df846fc
 +  return std::make_tuple(out, arg_out.to(at::kLong));
 +}
 +
-+// Whether the fused Metal fast path applies to this call.
-+bool metal_eligible(const at::Tensor& src,
-+                    const at::Tensor& index,
-+                    int64_t dim,
-+                    const std::optional<at::Tensor>& optional_out) {
-+  return metal_scatter().ok && !optional_out.has_value() && dim == 0 &&
-+         src.dim() == 2 && index.dim() == 2 &&
-+         metal_dtype_index(src.scalar_type()) >= 0 &&
-+         index.scalar_type() == at::kLong &&
-+         index.stride(1) == 0;  // column-broadcast from a 1-D edge index
++// Run the fused Metal path if this call is eligible; return nullopt otherwise.
++// Eligible when: pipelines built, no `out` provided, src dtype in {f32,f16,bf16},
++// index is int64 broadcast to src.shape, and the sizes fit the kernel's 32-bit
++// counters (positions < 2^31, source and output element counts < 2^32).
++std::optional<std::tuple<at::Tensor, at::Tensor>> maybe_scatter_metal(
++    const char* name,
++    const at::Tensor& src,
++    const at::Tensor& index,
++    int64_t dim,
++    const std::optional<at::Tensor>& optional_out,
++    std::optional<int64_t> dim_size,
++    uint32_t is_min) {
++  const int dtype_idx = metal_dtype_index(src.scalar_type());
++  if (!metal_scatter().ok || optional_out.has_value() || dtype_idx < 0 ||
++      index.scalar_type() != at::kLong || index.sizes() != src.sizes()) {
++    return std::nullopt;
++  }
++  auto sizes = output_sizes(name, src, index, dim, dim_size);
++  int64_t out_numel = 1;
++  for (auto s : sizes) out_numel *= s;
++  const int64_t i32_max = std::numeric_limits<int32_t>::max();
++  const int64_t u32_max = std::numeric_limits<uint32_t>::max();
++  if (src.size(dim) > i32_max || src.numel() > u32_max || out_numel > u32_max) {
++    return std::nullopt;
++  }
++  return scatter_metal_general(src, index, dim, sizes[dim], is_min, dtype_idx);
 +}
 +
 +std::tuple<at::Tensor, at::Tensor> scatter_min_mps(
@@ -428,10 +493,9 @@ index 0000000..df846fc
 +    std::optional<int64_t> dim_size) {
 +  check_scatter_inputs("scatter_min", src, index);
 +  dim = normalize_dim(dim, src.dim(), "scatter_min");
-+  if (metal_eligible(src, index, dim, optional_out)) {
-+    auto sizes = output_sizes("scatter_min", src, index, dim, dim_size);
-+    return scatter_metal_fast(src, index, sizes[dim], /*is_min=*/1u,
-+                              metal_dtype_index(src.scalar_type()));
++  if (auto r = maybe_scatter_metal("scatter_min", src, index, dim, optional_out,
++                                   dim_size, /*is_min=*/1u)) {
++    return *r;
 +  }
 +  return scatter_minmax_fallback(
 +      "scatter_min", "amin", src, index, dim, optional_out, dim_size,
@@ -451,10 +515,9 @@ index 0000000..df846fc
 +    std::optional<int64_t> dim_size) {
 +  check_scatter_inputs("scatter_max", src, index);
 +  dim = normalize_dim(dim, src.dim(), "scatter_max");
-+  if (metal_eligible(src, index, dim, optional_out)) {
-+    auto sizes = output_sizes("scatter_max", src, index, dim, dim_size);
-+    return scatter_metal_fast(src, index, sizes[dim], /*is_min=*/0u,
-+                              metal_dtype_index(src.scalar_type()));
++  if (auto r = maybe_scatter_metal("scatter_max", src, index, dim, optional_out,
++                                   dim_size, /*is_min=*/0u)) {
++    return *r;
 +  }
 +  return scatter_minmax_fallback(
 +      "scatter_max", "amax", src, index, dim, optional_out, dim_size,
