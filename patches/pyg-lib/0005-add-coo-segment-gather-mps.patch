@@ -1,0 +1,108 @@
+diff --git a/pyg_lib/csrc/ops/mps/segment_coo_kernel.cpp b/pyg_lib/csrc/ops/mps/segment_coo_kernel.cpp
+new file mode 100644
+index 0000000..3de0b1c
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/segment_coo_kernel.cpp
+@@ -0,0 +1,102 @@
++// Native MPS support for the COO segment/gather family.
++//
++// A COO segment reduction is exactly a scatter along `dim = index.dim() - 1`:
++// element `src[..., k, ...]` contributes to `out[..., index[..., k], ...]`.
++// So the whole `segment_*_coo` family delegates to the existing native/Metal
++// `scatter_*` kernels (sum/mul/mean native, min/max via the fused Metal kernel).
++// `gather_coo` is the inverse broadcast, i.e. a plain `index_select`.
++//
++// This turns a previously-unsupported hot aggregation path into native MPS with
++// no new kernel code, reusing the proven and benchmarked scatter implementations.
++
++#include "../scatter.h"
++#include "../segment_coo.h"
++#include "../utils.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++#include <tuple>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++int64_t reduce_dim(const at::Tensor& index) {
++  TORCH_CHECK(index.dim() >= 1, "segment_coo: index must have >= 1 dimension");
++  return index.dim() - 1;
++}
++
++// The scatter kernels expect an index already broadcast to `src.shape`. When we
++// call them from this backend, scatter's autograd broadcast layer is bypassed,
++// so we replicate it here with the same helper autograd uses.
++at::Tensor bcast(const at::Tensor& index, const at::Tensor& src, int64_t dim) {
++  return broadcast(index, src, dim);
++}
++
++at::Tensor segment_sum_coo_mps(const at::Tensor& src,
++                               const at::Tensor& index,
++                               const std::optional<at::Tensor>& out,
++                               std::optional<int64_t> dim_size) {
++  const int64_t dim = reduce_dim(index);
++  return scatter_sum(src, bcast(index, src, dim), dim, out, dim_size);
++}
++
++at::Tensor segment_mean_coo_mps(const at::Tensor& src,
++                                const at::Tensor& index,
++                                const std::optional<at::Tensor>& out,
++                                std::optional<int64_t> dim_size) {
++  const int64_t dim = reduce_dim(index);
++  return scatter_mean(src, bcast(index, src, dim), dim, out, dim_size);
++}
++
++std::tuple<at::Tensor, at::Tensor> segment_min_coo_mps(
++    const at::Tensor& src,
++    const at::Tensor& index,
++    const std::optional<at::Tensor>& out,
++    std::optional<int64_t> dim_size) {
++  const int64_t dim = reduce_dim(index);
++  return scatter_min(src, bcast(index, src, dim), dim, out, dim_size);
++}
++
++std::tuple<at::Tensor, at::Tensor> segment_max_coo_mps(
++    const at::Tensor& src,
++    const at::Tensor& index,
++    const std::optional<at::Tensor>& out,
++    std::optional<int64_t> dim_size) {
++  const int64_t dim = reduce_dim(index);
++  return scatter_max(src, bcast(index, src, dim), dim, out, dim_size);
++}
++
++// out[..., k, ...] = src[..., index[..., k], ...]; the broadcast inverse of a
++// segment reduction. For a 1-D index this is a plain index_select along `dim`.
++at::Tensor gather_coo_mps(const at::Tensor& src,
++                          const at::Tensor& index,
++                          const std::optional<at::Tensor>& out) {
++  const int64_t dim = reduce_dim(index);
++  TORCH_CHECK(index.dim() == 1,
++              "gather_coo (MPS): only a 1-D index is supported natively");
++  auto result = src.index_select(dim, index.contiguous());
++  if (out.has_value()) {
++    out.value().copy_(result);
++    return out.value();
++  }
++  return result;
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_sum_coo"),
++         TORCH_FN(segment_sum_coo_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_mean_coo"),
++         TORCH_FN(segment_mean_coo_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_min_coo"),
++         TORCH_FN(segment_min_coo_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_max_coo"),
++         TORCH_FN(segment_max_coo_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::gather_coo"), TORCH_FN(gather_coo_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg
