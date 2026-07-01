@@ -40,6 +40,58 @@ OPTIONAL_DEPENDENCY_MARKERS = [
     "requires 'torch-sparse",
 ]
 
+# How each MPS-facing case actually executes, independent of whether it merely
+# "runs". `native` means the work happens on the GPU through standard PyTorch or
+# our native pyg-lib MPS kernels. `cpu-assisted` means the operator accepts MPS
+# tensors but copies to CPU, runs the CPU kernel, and copies the result back --
+# functionally equivalent to PYTORCH_ENABLE_MPS_FALLBACK for that op. This split
+# keeps the reports honest: an `ok` on `mps:0` does not by itself prove GPU
+# execution.
+NATIVE = "native"
+CPU_ASSISTED = "cpu-assisted"
+
+IMPLEMENTATION: dict[str, str] = {
+    # torch core: standard PyTorch MPS kernels.
+    "tensor_create": NATIVE,
+    "matmul_backward": NATIVE,
+    "indexing": NATIVE,
+    "scatter_add_index_add": NATIVE,
+    "sparse_coo_mm": NATIVE,
+    # PyG high-level APIs.
+    "pyg_data_to_device": NATIVE,
+    "pyg_gcn_forward_backward": NATIVE,
+    "pyg_knn_graph": CPU_ASSISTED,  # routes to the pyg::knn CPU-assisted shim
+    "pyg_spline_conv": CPU_ASSISTED,  # routes to pyg::spline_* CPU-assisted shims
+    # pyg-lib scatter family: native MPS kernels. scatter_min/max reduce values
+    # with MPS scatter_reduce and derive arg indices on-device in int32.
+    "pyg_lib_scatter_sum": NATIVE,
+    "pyg_lib_scatter_mul": NATIVE,
+    "pyg_lib_scatter_mean": NATIVE,
+    "pyg_lib_scatter_min": NATIVE,
+    "pyg_lib_scatter_max": NATIVE,
+    # pyg-lib point-cloud + spline: CPU-assisted MPS dispatch shims. These are
+    # rarely-hot preprocessing ops, so CPU execution is an intentional choice.
+    "pyg_lib_knn": CPU_ASSISTED,
+    "pyg_lib_radius": CPU_ASSISTED,
+    "pyg_lib_nearest": CPU_ASSISTED,
+    "pyg_lib_fps": CPU_ASSISTED,
+    "pyg_lib_grid_cluster": CPU_ASSISTED,
+    "pyg_lib_spline_basis": CPU_ASSISTED,
+    "pyg_lib_spline_weighting": CPU_ASSISTED,
+}
+
+
+def apply_impl(results: dict[str, Any], device: str) -> dict[str, Any]:
+    """Annotate each successful MPS case with how it actually executes."""
+    if device != "mps":
+        return results
+    for name, case in results.items():
+        if isinstance(case, dict) and case.get("status") == "ok":
+            impl = IMPLEMENTATION.get(name)
+            if impl:
+                case["impl"] = impl
+    return results
+
 
 class SkipCase(Exception):
     """Signal that a probe case is not applicable in the current stage."""
@@ -398,6 +450,8 @@ def main() -> int:
         report["tests"]["torch_core"] = torch_core_cases(torch, args.device)
         report["tests"]["pyg"] = pyg_cases(torch, args.device)
         report["tests"]["pyg_lib"] = pyg_lib_cases(torch, args.device)
+        for group in report["tests"].values():
+            apply_impl(group, args.device)
 
     payload = json.dumps(report, indent=2, sort_keys=True)
     print(payload)
