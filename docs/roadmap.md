@@ -83,9 +83,10 @@ Candidate first kernels:
   64-bit atomic that packs an order-preserving value transform with the source
   position; a second kernel unpacks. 4-30x faster than the prior five-op tensor
   path and 10-36x faster than CPU. Covers the message-passing hot path (2-D
-  float32, `dim == 0`, broadcast index); other cases fall back to the int32
-  tensor path. Verified with heavy-contention parity tests. This is the first
-  dedicated Metal kernel and the model for future ones.
+  float32/float16/bfloat16, `dim == 0`, broadcast index) by promoting reduced
+  precision to float32 in-shader; other cases fall back to the int32 tensor
+  path. Verified with dtype-parametrized heavy-contention parity tests. This is
+  the first dedicated Metal kernel and the model for future ones.
 - `pyg::knn`, `pyg::radius`, `pyg::nearest`, `pyg::fps`, `pyg::grid_cluster`:
   CPU-assisted MPS shims are verified on real MPS.
 - `pyg::spline_basis` and `pyg::spline_weighting`: CPU-assisted MPS shims

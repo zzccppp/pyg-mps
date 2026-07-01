@@ -368,3 +368,21 @@ Performance (`benchmarks/REPORT.md`): the fused kernel is 4-30x faster than the
 five-op path and 10-36x faster than CPU; at 1M edges it drops `scatter_max` from
 177 ms to 5.9 ms. Native/CPU-assisted probe counts are unchanged (still 12/9);
 `scatter_min`/`scatter_max` remain native but are now Metal-backed.
+
+## 2026-07-01: Fused Metal kernel extended to float16 and bfloat16
+
+The kernel originally covered only float32; fp16/bf16 fell back to the tensor
+path. It now handles all three float dtypes via templated pack/unpack helpers
+with typed entry points (`scatter_pack_f32/f16/bf16`,
+`scatter_unpack_f32/f16/bf16`), selected by a per-dtype pipeline index. Half is
+promoted with Metal's native `half`; bfloat16 is carried as its raw 16-bit
+pattern and promoted with `as_type<float>(uint(bits) << 16)`, so the kernel does
+not depend on Metal's `bfloat` type. Results are written back in the native
+dtype, which is lossless because the value came from an actual source element.
+
+Because promotion is exact and monotonic, fp16/bf16 match the CPU kernel
+**exactly** (value and arg), even under heavy contention -- verified by the
+dtype-parametrized heavy-ties parity tests (now 34 cases total). Timing: fp16 and
+bf16 see the same win as float32, ~29-36x over the tensor path at 100k-1M edges
+(e.g. bf16 at 1M: 5.05 ms vs 180.97 ms). The remaining fallback cases are
+`dim != 0` and genuine (non-broadcast) 2-D index tensors.

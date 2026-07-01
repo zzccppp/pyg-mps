@@ -24,7 +24,9 @@ operator-level failure classification.
   (order-preserving float→uint packing + complemented-index tie-break),
   replacing a five-op tensor sequence. **4–30× faster than the prior path and
   10–36× faster than CPU** (177 ms → 5.9 ms at 1M edges), verified for exact
-  value/arg parity under heavy atomic contention.
+  value/arg parity under heavy atomic contention. Extended it to float16 and
+  bfloat16 by promoting to float32 in-shader (bf16 via bit-shift, no dependency
+  on Metal's bfloat type), preserving exact parity and the same speedup.
 - Engineered the pre-Metal fallback too: an int32-based **on-device**
   argmin/argmax to bypass MPS's missing int64 `scatter_reduce`, eliminating a
   per-call CPU round-trip; it remains the correctness fallback for

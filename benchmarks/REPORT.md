@@ -54,10 +54,15 @@ operation to under 6 ms. Correctness (value **and** arg, including tie-breaking
 under heavy atomic contention) is verified against the CPU kernel and
 `torch_scatter` in `tests/test_scatter_parity.py`.
 
-The kernel covers the message-passing hot path: 2-D float32 `src`, `dim == 0`,
-and a column-broadcast index (what PyG produces from a 1-D edge index). Other
-shapes/dtypes (fp16/bf16, `dim != 0`, genuine 2-D index) fall back to the
-portable int32 tensor path, which remains correct and tested.
+The kernel covers the message-passing hot path: 2-D `src` in float32, **float16,
+or bfloat16**, `dim == 0`, and a column-broadcast index (what PyG produces from a
+1-D edge index). Half/bfloat inputs are promoted to float32 inside the shader
+(bf16 via a bit shift, avoiding any dependency on Metal's bfloat type) and the
+result is written back in the native dtype -- losslessly, since the value came
+from an actual source element. fp16/bf16 therefore match the CPU kernel
+**exactly** (value and arg) and see the same speedup: ~29-36x over the tensor
+path at 100k-1M edges. Only `dim != 0` or a genuine (non-broadcast) 2-D index
+now fall back to the portable int32 tensor path.
 
 ## Result 2 — hand-written kernel vs relying on generic ops
 
@@ -92,5 +97,5 @@ win is.
 
 ## Next steps
 
-- Extend the fused kernel to fp16/bf16 `src` (currently falls back).
+- Widen the fast path to `dim != 0` and genuine 2-D index tensors.
 - A fused segment-CSR max could give the same treatment to sorted-index paths.
