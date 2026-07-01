@@ -1,9 +1,9 @@
 diff --git a/pyg_lib/csrc/ops/mps/scatter_kernel.cpp b/pyg_lib/csrc/ops/mps/scatter_kernel.cpp
 new file mode 100644
-index 0000000..cf61fc7
+index 0000000..0d149ea
 --- /dev/null
 +++ b/pyg_lib/csrc/ops/mps/scatter_kernel.cpp
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,248 @@
 +#include "../scatter.h"
 +
 +#include <ATen/ATen.h>
@@ -147,7 +147,15 @@ index 0000000..cf61fc7
 +
 +  auto src_c = src.contiguous();
 +  auto index_c = index.contiguous();
-+  const int64_t sentinel = src_c.size(dim);
++  const int64_t dim_len = src_c.size(dim);
++  // The arg reduction runs on MPS in int32 because MPS does not implement
++  // int64 scatter_reduce. Positions along `dim` must therefore fit in int32,
++  // which holds for any realistic graph (dim_len < 2^31).
++  TORCH_CHECK(
++      dim_len <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
++      name, ": src.size(dim)=", dim_len,
++      " exceeds the int32 range required by the MPS arg path");
++  const int32_t sentinel = static_cast<int32_t>(dim_len);
 +
 +  at::Tensor out;
 +  const bool out_was_provided = optional_out.has_value();
@@ -161,38 +169,40 @@ index 0000000..cf61fc7
 +    fill(out);
 +  }
 +
-+  auto arg_out_cpu =
-+      at::full(out.sizes(), sentinel,
-+               index_c.options().device(at::kCPU).dtype(at::kLong));
++  // arg_out stays on the source (MPS) device as int32; it is widened to the
++  // int64 tensor pyg-lib callers expect right before returning.
++  auto arg_out =
++      at::full(out.sizes(), sentinel, index_c.options().dtype(at::kInt));
 +
 +  if (src_c.numel() == 0) {
 +    if (!out_was_provided) {
 +      out.zero_();
 +    }
-+    return std::make_tuple(out, arg_out_cpu.to(index_c.device()));
++    return std::make_tuple(out, arg_out.to(at::kLong));
 +  }
 +
 +  out.scatter_reduce_(dim, index_c, src_c, reduce, true);
 +
++  // Recover the arg index fully on device: flag every source position whose
++  // value equals its group's reduced value, then take the smallest such
++  // position per group via an int32 scatter_reduce("amin"). Exact float
++  // equality is valid here because amin/amax select an actual source element
++  // rather than computing a new value.
 +  auto gathered = out.gather(dim, index_c);
-+  auto src_cpu = src_c.cpu();
-+  auto index_cpu = index_c.cpu();
-+  auto gathered_cpu = gathered.cpu();
 +  auto position_sizes = std::vector<int64_t>(src_c.dim(), 1);
-+  position_sizes[dim] = src_c.size(dim);
-+  auto positions = at::arange(src_c.size(dim),
-+                              index_cpu.options().dtype(at::kLong))
++  position_sizes[dim] = dim_len;
++  auto positions = at::arange(dim_len, index_c.options().dtype(at::kInt))
 +                       .reshape(position_sizes)
-+                       .expand_as(index_cpu);
-+  auto candidates = at::where(src_cpu.eq(gathered_cpu), positions,
-+                              at::full_like(index_cpu, sentinel));
-+  arg_out_cpu.scatter_reduce_(dim, index_cpu, candidates, "amin", true);
++                       .expand_as(index_c);
++  auto candidates = at::where(src_c.eq(gathered), positions,
++                              at::full_like(positions, sentinel));
++  arg_out.scatter_reduce_(dim, index_c, candidates, "amin", true);
 +
 +  if (!out_was_provided) {
-+    out.masked_fill_((arg_out_cpu == sentinel).to(out.device()), 0);
++    out.masked_fill_(arg_out == sentinel, 0);
 +  }
 +
-+  return std::make_tuple(out, arg_out_cpu.to(index_c.device()));
++  return std::make_tuple(out, arg_out.to(at::kLong));
 +}
 +
 +std::tuple<at::Tensor, at::Tensor> scatter_min_mps(
