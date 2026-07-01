@@ -1,9 +1,9 @@
 diff --git a/pyg_lib/csrc/ops/mps/scatter_kernel.cpp b/pyg_lib/csrc/ops/mps/scatter_kernel.cpp
 new file mode 100644
-index 0000000..0d149ea
+index 0000000..7dd4bc0
 --- /dev/null
 +++ b/pyg_lib/csrc/ops/mps/scatter_kernel.cpp
-@@ -0,0 +1,248 @@
+@@ -0,0 +1,141 @@
 +#include "../scatter.h"
 +
 +#include <ATen/ATen.h>
@@ -131,123 +131,16 @@ index 0000000..0d149ea
 +  return out;
 +}
 +
-+template <typename Fill>
-+std::tuple<at::Tensor, at::Tensor> scatter_minmax_mps(
-+    const char* name,
-+    const char* reduce,
-+    const at::Tensor& src,
-+    const at::Tensor& index,
-+    int64_t dim,
-+    const std::optional<at::Tensor>& optional_out,
-+    std::optional<int64_t> dim_size,
-+    Fill fill) {
-+  check_scatter_inputs(name, src, index);
-+
-+  dim = normalize_dim(dim, src.dim(), name);
-+
-+  auto src_c = src.contiguous();
-+  auto index_c = index.contiguous();
-+  const int64_t dim_len = src_c.size(dim);
-+  // The arg reduction runs on MPS in int32 because MPS does not implement
-+  // int64 scatter_reduce. Positions along `dim` must therefore fit in int32,
-+  // which holds for any realistic graph (dim_len < 2^31).
-+  TORCH_CHECK(
-+      dim_len <= static_cast<int64_t>(std::numeric_limits<int32_t>::max()),
-+      name, ": src.size(dim)=", dim_len,
-+      " exceeds the int32 range required by the MPS arg path");
-+  const int32_t sentinel = static_cast<int32_t>(dim_len);
-+
-+  at::Tensor out;
-+  const bool out_was_provided = optional_out.has_value();
-+  if (out_was_provided) {
-+    const auto& optional = optional_out.value();
-+    check_optional_out(name, src_c, optional, dim);
-+    out = optional.contiguous();
-+  } else {
-+    auto sizes = output_sizes(name, src_c, index_c, dim, dim_size);
-+    out = at::empty(sizes, src_c.options());
-+    fill(out);
-+  }
-+
-+  // arg_out stays on the source (MPS) device as int32; it is widened to the
-+  // int64 tensor pyg-lib callers expect right before returning.
-+  auto arg_out =
-+      at::full(out.sizes(), sentinel, index_c.options().dtype(at::kInt));
-+
-+  if (src_c.numel() == 0) {
-+    if (!out_was_provided) {
-+      out.zero_();
-+    }
-+    return std::make_tuple(out, arg_out.to(at::kLong));
-+  }
-+
-+  out.scatter_reduce_(dim, index_c, src_c, reduce, true);
-+
-+  // Recover the arg index fully on device: flag every source position whose
-+  // value equals its group's reduced value, then take the smallest such
-+  // position per group via an int32 scatter_reduce("amin"). Exact float
-+  // equality is valid here because amin/amax select an actual source element
-+  // rather than computing a new value.
-+  auto gathered = out.gather(dim, index_c);
-+  auto position_sizes = std::vector<int64_t>(src_c.dim(), 1);
-+  position_sizes[dim] = dim_len;
-+  auto positions = at::arange(dim_len, index_c.options().dtype(at::kInt))
-+                       .reshape(position_sizes)
-+                       .expand_as(index_c);
-+  auto candidates = at::where(src_c.eq(gathered), positions,
-+                              at::full_like(positions, sentinel));
-+  arg_out.scatter_reduce_(dim, index_c, candidates, "amin", true);
-+
-+  if (!out_was_provided) {
-+    out.masked_fill_(arg_out == sentinel, 0);
-+  }
-+
-+  return std::make_tuple(out, arg_out.to(at::kLong));
-+}
-+
-+std::tuple<at::Tensor, at::Tensor> scatter_min_mps(
-+    const at::Tensor& src,
-+    const at::Tensor& index,
-+    int64_t dim,
-+    const std::optional<at::Tensor>& optional_out,
-+    std::optional<int64_t> dim_size) {
-+  return scatter_minmax_mps(
-+      "scatter_min", "amin", src, index, dim, optional_out, dim_size,
-+      [&](at::Tensor& out) {
-+        AT_DISPATCH_ALL_TYPES_AND2(
-+            at::ScalarType::Half, at::ScalarType::BFloat16, out.scalar_type(),
-+            "scatter_min_mps_init_out",
-+            [&] { out.fill_(std::numeric_limits<scalar_t>::max()); });
-+      });
-+}
-+
-+std::tuple<at::Tensor, at::Tensor> scatter_max_mps(
-+    const at::Tensor& src,
-+    const at::Tensor& index,
-+    int64_t dim,
-+    const std::optional<at::Tensor>& optional_out,
-+    std::optional<int64_t> dim_size) {
-+  return scatter_minmax_mps(
-+      "scatter_max", "amax", src, index, dim, optional_out, dim_size,
-+      [&](at::Tensor& out) {
-+        AT_DISPATCH_ALL_TYPES_AND2(
-+            at::ScalarType::Half, at::ScalarType::BFloat16, out.scalar_type(),
-+            "scatter_max_mps_init_out",
-+            [&] { out.fill_(std::numeric_limits<scalar_t>::lowest()); });
-+      });
-+}
-+
 +}  // namespace
 +
++// scatter_min / scatter_max are registered for MPS in mps/scatter_metal.mm,
++// which provides a fused single-pass Metal kernel (value + arg) with an int32
++// tensor-op fallback for shapes/dtypes outside the hot path.
 +TORCH_LIBRARY_IMPL(pyg, MPS, m) {
 +  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_sum"),
 +         TORCH_FN(scatter_sum_mps));
 +  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_mul"),
 +         TORCH_FN(scatter_mul_mps));
-+  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_min"),
-+         TORCH_FN(scatter_min_mps));
-+  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_max"),
-+         TORCH_FN(scatter_max_mps));
 +}
 +
 +}  // namespace ops
