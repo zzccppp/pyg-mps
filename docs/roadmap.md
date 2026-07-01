@@ -82,11 +82,13 @@ Candidate first kernels:
   (`mps/scatter_metal.mm`). Value and arg index are computed together via a
   64-bit atomic that packs an order-preserving value transform with the source
   position; a second kernel unpacks. 4-30x faster than the prior five-op tensor
-  path and 10-36x faster than CPU. Covers the message-passing hot path (2-D
-  float32/float16/bfloat16, `dim == 0`, broadcast index) by promoting reduced
-  precision to float32 in-shader; other cases fall back to the int32 tensor
-  path. Verified with dtype-parametrized heavy-contention parity tests. This is
-  the first dedicated Metal kernel and the model for future ones.
+  path and 10-36x faster than CPU. Handles an arbitrary `dim` and rank (viewing
+  src as `[outer, D, inner]`), broadcast and genuine per-element indices, and
+  float32/float16/bfloat16 (reduced precision promoted to float32 in-shader).
+  Only a caller-provided `out` and tensors exceeding the kernel's 32-bit
+  counters fall back to the int32 tensor path. Verified exactly across dims,
+  ranks, index modes, and dtypes (58-case parity suite). This is the first
+  dedicated Metal kernel and the model for future ones.
 - `pyg::knn`, `pyg::radius`, `pyg::nearest`, `pyg::fps`, `pyg::grid_cluster`:
   CPU-assisted MPS shims are verified on real MPS.
 - `pyg::spline_basis` and `pyg::spline_weighting`: CPU-assisted MPS shims

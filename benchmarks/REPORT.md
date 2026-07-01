@@ -54,15 +54,21 @@ operation to under 6 ms. Correctness (value **and** arg, including tie-breaking
 under heavy atomic contention) is verified against the CPU kernel and
 `torch_scatter` in `tests/test_scatter_parity.py`.
 
-The kernel covers the message-passing hot path: 2-D `src` in float32, **float16,
-or bfloat16**, `dim == 0`, and a column-broadcast index (what PyG produces from a
-1-D edge index). Half/bfloat inputs are promoted to float32 inside the shader
-(bf16 via a bit shift, avoiding any dependency on Metal's bfloat type) and the
-result is written back in the native dtype -- losslessly, since the value came
-from an actual source element. fp16/bf16 therefore match the CPU kernel
-**exactly** (value and arg) and see the same speedup: ~29-36x over the tensor
-path at 100k-1M edges. Only `dim != 0` or a genuine (non-broadcast) 2-D index
-now fall back to the portable int32 tensor path.
+The kernel handles an **arbitrary `dim` and rank** by viewing `src` as
+`[outer, D, inner]`, both a **broadcast index** (from a 1-D edge index) and a
+**genuine per-element index**, in **float32, float16, and bfloat16**. Half/bfloat
+inputs are promoted to float32 inside the shader (bf16 via a bit shift, avoiding
+any dependency on Metal's bfloat type) and written back in the native dtype --
+losslessly, since the value came from an actual source element. All of these
+match the CPU kernel **exactly** (value and arg), verified across dims, ranks,
+index modes, and dtypes. Only a caller-provided `out` (include_self) and tensors
+too large for the kernel's 32-bit counters fall back to the int32 tensor path.
+
+Timing notes: the general `[outer, D, inner]` formulation does not regress the
+`dim == 0` hot path (5.74 ms at 1M edges), and `dim == 1` is comparable
+(4.96 ms). A genuine per-element index is slower (~36 ms at 1M x 64) because it
+materialises and reads a full-size int64 index, but that is a rare case and still
+well ahead of the tensor fallback.
 
 ## Result 2 — hand-written kernel vs relying on generic ops
 
@@ -97,5 +103,6 @@ win is.
 
 ## Next steps
 
-- Widen the fast path to `dim != 0` and genuine 2-D index tensors.
+- Speed up the genuine per-element index case (currently materialises the full
+  int64 index).
 - A fused segment-CSR max could give the same treatment to sorted-index paths.

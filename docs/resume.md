@@ -26,7 +26,10 @@ operator-level failure classification.
   10–36× faster than CPU** (177 ms → 5.9 ms at 1M edges), verified for exact
   value/arg parity under heavy atomic contention. Extended it to float16 and
   bfloat16 by promoting to float32 in-shader (bf16 via bit-shift, no dependency
-  on Metal's bfloat type), preserving exact parity and the same speedup.
+  on Metal's bfloat type), and generalized it to an arbitrary reduction `dim`
+  and rank (viewing the tensor as `[outer, D, inner]`) plus genuine per-element
+  indices -- all verified exactly against `torch_scatter` (58-case parity suite)
+  with no regression on the hot path.
 - Engineered the pre-Metal fallback too: an int32-based **on-device**
   argmin/argmax to bypass MPS's missing int64 `scatter_reduce`, eliminating a
   per-call CPU round-trip; it remains the correctness fallback for

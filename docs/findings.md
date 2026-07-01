@@ -381,8 +381,32 @@ not depend on Metal's `bfloat` type. Results are written back in the native
 dtype, which is lossless because the value came from an actual source element.
 
 Because promotion is exact and monotonic, fp16/bf16 match the CPU kernel
-**exactly** (value and arg), even under heavy contention -- verified by the
-dtype-parametrized heavy-ties parity tests (now 34 cases total). Timing: fp16 and
-bf16 see the same win as float32, ~29-36x over the tensor path at 100k-1M edges
-(e.g. bf16 at 1M: 5.05 ms vs 180.97 ms). The remaining fallback cases are
-`dim != 0` and genuine (non-broadcast) 2-D index tensors.
+**exactly** (value and arg), even under heavy contention. Timing: fp16 and bf16
+see the same win as float32, ~29-36x over the tensor path at 100k-1M edges
+(e.g. bf16 at 1M: 5.05 ms vs 180.97 ms).
+
+## 2026-07-01: Fused Metal kernel generalized to arbitrary dim and 2-D index
+
+The kernel originally required `dim == 0`, a 2-D `src`, and a column-broadcast
+index. It now handles an **arbitrary `dim` and rank** and both broadcast and
+genuine per-element indices, by viewing `src` as `[OUTER, D, INNER]` (OUTER =
+product of dims before `dim`, D = size along `dim`, INNER = product of dims
+after). For a source element `gid` with coordinates `(o, k, j)` the target cell
+is `(o * DIMSZ + n) * INNER + j` where `n` is the scatter index; the recorded arg
+is `k` (the position along `dim`). The empty-cell sentinel becomes `D =
+src.size(dim)`.
+
+A `idx_mode` flag selects between a length-D broadcast index (`idx[k]`, detected
+by all non-`dim` strides being 0 and extracted with pure views) and a full
+per-element index (`idx[gid]`, materialised contiguous). The `[OUTER, D, INNER]`
+mapping was verified in pure PyTorch against `torch_scatter` before the C++ port.
+
+Eligibility now falls back only when `out` is provided (include_self) or the
+tensors exceed the kernel's 32-bit counters (`src.size(dim) >= 2^31`, or source /
+output element counts `>= 2^32`); everything else with a supported float dtype
+uses Metal. Verified exactly (value and arg) across `dim` 0/1/2 and negative dim,
+2-D and 3-D, broadcast and genuine index, and all three float dtypes (parity
+suite now 58 cases; the int32 fallback path is also covered). No regression on
+the `dim == 0` hot path (5.74 ms at 1M edges); `dim == 1` is comparable
+(4.96 ms). A genuine per-element index is slower (~36 ms at 1M x 64) because it
+reads a full-size int64 index.
