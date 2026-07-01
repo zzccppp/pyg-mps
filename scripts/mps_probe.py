@@ -294,6 +294,53 @@ def pyg_lib_cases(torch: Any, device: str) -> dict[str, Any]:
         out = ops.scatter_sum(src, index, dim=0, dim_size=4)
         return {"shape": list(out.shape), "device": str(out.device), "sum": float(out.sum().detach().cpu())}
 
+    def scatter_inputs() -> tuple[Any, Any]:
+        src = torch.tensor(
+            [
+                [1.0, 2.0, 3.0],
+                [4.0, 5.0, 6.0],
+                [-1.0, 2.0, 0.0],
+                [2.0, 3.0, 4.0],
+                [1.0, -2.0, 2.0],
+                [5.0, 1.0, -3.0],
+            ],
+            device=device,
+        )
+        index = torch.tensor([0, 1, 0, 2, 1, 3], dtype=torch.long, device=device)
+        return src, index
+
+    def direct_scatter_mul() -> dict[str, Any]:
+        src, index = scatter_inputs()
+        out = ops.scatter_mul(src, index, dim=0, dim_size=4)
+        return {"shape": list(out.shape), "device": str(out.device), "sum": float(out.sum().detach().cpu())}
+
+    def direct_scatter_mean() -> dict[str, Any]:
+        src, index = scatter_inputs()
+        out = ops.scatter_mean(src, index, dim=0, dim_size=4)
+        return {"shape": list(out.shape), "device": str(out.device), "sum": float(out.sum().detach().cpu())}
+
+    def direct_scatter_min() -> dict[str, Any]:
+        src, index = scatter_inputs()
+        out, arg_out = ops.scatter_min(src, index, dim=0, dim_size=4)
+        return {
+            "shape": list(out.shape),
+            "device": str(out.device),
+            "arg_shape": list(arg_out.shape),
+            "arg_device": str(arg_out.device),
+            "sum": float(out.sum().detach().cpu()),
+        }
+
+    def direct_scatter_max() -> dict[str, Any]:
+        src, index = scatter_inputs()
+        out, arg_out = ops.scatter_max(src, index, dim=0, dim_size=4)
+        return {
+            "shape": list(out.shape),
+            "device": str(out.device),
+            "arg_shape": list(arg_out.shape),
+            "arg_device": str(arg_out.device),
+            "sum": float(out.sum().detach().cpu()),
+        }
+
     cases["pyg_lib_knn"] = direct_knn
     cases["pyg_lib_radius"] = direct_radius
     cases["pyg_lib_nearest"] = direct_nearest
@@ -302,6 +349,10 @@ def pyg_lib_cases(torch: Any, device: str) -> dict[str, Any]:
     cases["pyg_lib_spline_basis"] = direct_spline_basis
     cases["pyg_lib_spline_weighting"] = direct_spline_weighting
     cases["pyg_lib_scatter_sum"] = direct_scatter_sum
+    cases["pyg_lib_scatter_mul"] = direct_scatter_mul
+    cases["pyg_lib_scatter_mean"] = direct_scatter_mean
+    cases["pyg_lib_scatter_min"] = direct_scatter_min
+    cases["pyg_lib_scatter_max"] = direct_scatter_max
 
     return {name: run_case(fn) for name, fn in cases.items()}
 

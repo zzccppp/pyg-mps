@@ -1,0 +1,188 @@
+diff --git a/pyg_lib/csrc/ops/mps/point_cloud_kernel.cpp b/pyg_lib/csrc/ops/mps/point_cloud_kernel.cpp
+new file mode 100644
+index 0000000..4123066
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/point_cloud_kernel.cpp
+@@ -0,0 +1,85 @@
++#include "../cluster.h"
++#include "../fps.h"
++#include "../knn.h"
++#include "../nearest.h"
++#include "../radius.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++std::optional<at::Tensor> cpu_optional(
++    const std::optional<at::Tensor>& tensor) {
++  if (!tensor.has_value()) {
++    return std::nullopt;
++  }
++  return tensor.value().cpu().contiguous();
++}
++
++at::Tensor knn_mps(const at::Tensor& x,
++                   const at::Tensor& y,
++                   const std::optional<at::Tensor>& ptr_x,
++                   const std::optional<at::Tensor>& ptr_y,
++                   int64_t k,
++                   bool cosine,
++                   int64_t num_workers) {
++  auto out = knn(x.cpu(), y.cpu(), cpu_optional(ptr_x), cpu_optional(ptr_y), k,
++                 cosine, num_workers);
++  return out.to(x.device());
++}
++
++at::Tensor radius_mps(const at::Tensor& x,
++                      const at::Tensor& y,
++                      const std::optional<at::Tensor>& ptr_x,
++                      const std::optional<at::Tensor>& ptr_y,
++                      double r,
++                      int64_t max_num_neighbors,
++                      int64_t num_workers,
++                      bool ignore_same_index) {
++  auto out = radius(x.cpu(), y.cpu(), cpu_optional(ptr_x), cpu_optional(ptr_y),
++                    r, max_num_neighbors, num_workers, ignore_same_index);
++  return out.to(x.device());
++}
++
++at::Tensor nearest_mps(const at::Tensor& x,
++                       const at::Tensor& y,
++                       const std::optional<at::Tensor>& ptr_x,
++                       const std::optional<at::Tensor>& ptr_y) {
++  auto out =
++      nearest(x.cpu(), y.cpu(), cpu_optional(ptr_x), cpu_optional(ptr_y));
++  return out.to(x.device());
++}
++
++at::Tensor fps_mps(const at::Tensor& src,
++                   const at::Tensor& ptr,
++                   double ratio,
++                   bool random_start) {
++  auto out = fps(src.cpu(), ptr.cpu(), ratio, random_start);
++  return out.to(src.device());
++}
++
++at::Tensor grid_cluster_mps(const at::Tensor& pos,
++                            const at::Tensor& size,
++                            const std::optional<at::Tensor>& start,
++                            const std::optional<at::Tensor>& end) {
++  auto out = grid_cluster(pos.cpu(), size.cpu(), cpu_optional(start),
++                          cpu_optional(end));
++  return out.to(pos.device());
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::knn"), TORCH_FN(knn_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::radius"), TORCH_FN(radius_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::nearest"), TORCH_FN(nearest_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::fps"), TORCH_FN(fps_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::grid_cluster"),
++         TORCH_FN(grid_cluster_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg
+diff --git a/pyg_lib/csrc/ops/mps/spline_kernel.cpp b/pyg_lib/csrc/ops/mps/spline_kernel.cpp
+new file mode 100644
+index 0000000..6445ae1
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/spline_kernel.cpp
+@@ -0,0 +1,91 @@
++#include "../spline.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++#include <tuple>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++std::tuple<at::Tensor, at::Tensor> spline_basis_mps(
++    const at::Tensor& pseudo,
++    const at::Tensor& kernel_size,
++    const at::Tensor& is_open_spline,
++    int64_t degree) {
++  auto result = spline_basis(pseudo.cpu(), kernel_size.cpu(),
++                             is_open_spline.cpu(), degree);
++  return std::make_tuple(std::get<0>(result).to(pseudo.device()),
++                         std::get<1>(result).to(pseudo.device()));
++}
++
++at::Tensor spline_basis_backward_mps(const at::Tensor& grad_basis,
++                                     const at::Tensor& pseudo,
++                                     const at::Tensor& kernel_size,
++                                     const at::Tensor& is_open_spline,
++                                     int64_t degree) {
++  auto out = spline_basis_backward(grad_basis.cpu(), pseudo.cpu(),
++                                   kernel_size.cpu(), is_open_spline.cpu(),
++                                   degree);
++  return out.to(pseudo.device());
++}
++
++at::Tensor spline_weighting_mps(const at::Tensor& x,
++                                const at::Tensor& weight,
++                                const at::Tensor& basis,
++                                const at::Tensor& weight_index) {
++  auto out = spline_weighting(x.cpu(), weight.cpu(), basis.cpu(),
++                              weight_index.cpu());
++  return out.to(x.device());
++}
++
++at::Tensor spline_weighting_backward_x_mps(const at::Tensor& grad_out,
++                                           const at::Tensor& weight,
++                                           const at::Tensor& basis,
++                                           const at::Tensor& weight_index) {
++  auto out = spline_weighting_backward_x(
++      grad_out.cpu(), weight.cpu(), basis.cpu(), weight_index.cpu());
++  return out.to(grad_out.device());
++}
++
++at::Tensor spline_weighting_backward_weight_mps(
++    const at::Tensor& grad_out,
++    const at::Tensor& x,
++    const at::Tensor& basis,
++    const at::Tensor& weight_index,
++    int64_t kernel_size) {
++  auto out = spline_weighting_backward_weight(
++      grad_out.cpu(), x.cpu(), basis.cpu(), weight_index.cpu(), kernel_size);
++  return out.to(grad_out.device());
++}
++
++at::Tensor spline_weighting_backward_basis_mps(
++    const at::Tensor& grad_out,
++    const at::Tensor& x,
++    const at::Tensor& weight,
++    const at::Tensor& weight_index) {
++  auto out = spline_weighting_backward_basis(
++      grad_out.cpu(), x.cpu(), weight.cpu(), weight_index.cpu());
++  return out.to(grad_out.device());
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spline_basis"),
++         TORCH_FN(spline_basis_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spline_basis_backward"),
++         TORCH_FN(spline_basis_backward_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spline_weighting"),
++         TORCH_FN(spline_weighting_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spline_weighting_backward_x"),
++         TORCH_FN(spline_weighting_backward_x_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spline_weighting_backward_weight"),
++         TORCH_FN(spline_weighting_backward_weight_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spline_weighting_backward_basis"),
++         TORCH_FN(spline_weighting_backward_basis_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg

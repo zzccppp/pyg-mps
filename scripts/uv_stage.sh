@@ -25,6 +25,29 @@ ensure_venv() {
   fi
 }
 
+cpu_count() {
+  "${venv_python}" - <<'PY'
+import os
+print(os.cpu_count() or 4)
+PY
+}
+
+apply_local_patches() {
+  local patch
+  for patch in patches/pyg-lib/*.patch; do
+    [[ -e "${patch}" ]] || continue
+    local rel_patch="../../${patch}"
+    if git -C src/pyg-lib apply --check "${rel_patch}" 2>/dev/null; then
+      git -C src/pyg-lib apply "${rel_patch}"
+    elif git -C src/pyg-lib apply --reverse --check "${rel_patch}" 2>/dev/null; then
+      true
+    else
+      echo "pyg-lib patch did not apply cleanly: ${patch}" >&2
+      exit 1
+    fi
+  done
+}
+
 probe() {
   local probe_stage="${1:-${stage}}"
   local device="${2:-mps}"
@@ -75,10 +98,89 @@ install_pyg_native() {
   probe "${package}" mps
 }
 
+install_mps_stack() {
+  ensure_venv
+  uv pip install torch torch-geometric
+  local wheel_index="${PYG_WHL_INDEX:-$(pyg_wheel_index)}"
+  uv pip install pyg-lib --find-links "${wheel_index}"
+}
+
+install_local_pyg() {
+  ensure_venv
+  uv pip install --no-deps -e src/pytorch_geometric
+}
+
+install_local_pyg_lib() {
+  ensure_venv
+  apply_local_patches
+  CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$(cpu_count)}" \
+    uv pip install --reinstall --no-build-isolation --no-deps -e src/pyg-lib
+}
+
+install_local_optionals() {
+  ensure_venv
+  uv pip install scipy
+  uv pip install --reinstall --no-build-isolation --no-deps \
+    -e src/pytorch_scatter \
+    -e src/pytorch_sparse \
+    -e src/pytorch_cluster \
+    -e src/pytorch_spline_conv
+}
+
+verify_mps_stack() {
+  ensure_venv
+  probe pyg-macos-native mps || true
+  probe_with_mps_fallback pyg-macos-fallback || true
+  "${venv_python}" scripts/report_summary.py
+}
+
 case "${stage}" in
   init)
     ensure_venv
     "${venv_python}" --version
+    ;;
+  sync-sources)
+    scripts/sync_sources.sh
+    ;;
+  bootstrap)
+    install_mps_stack
+    verify_mps_stack
+    ;;
+  install-mps)
+    install_mps_stack
+    ;;
+  install-local-pyg)
+    install_local_pyg
+    ;;
+  install-local-pyg-lib)
+    install_local_pyg_lib
+    ;;
+  install-local-optionals)
+    install_local_optionals
+    ;;
+  install-local)
+    install_local_pyg
+    install_local_pyg_lib
+    ;;
+  verify-mps)
+    verify_mps_stack
+    ;;
+  meta)
+    ensure_venv
+    "${venv_python}" scripts/meta_probe.py
+    ;;
+  extensions-cpu)
+    ensure_venv
+    "${venv_python}" scripts/extension_probe.py --device cpu
+    ;;
+  extensions-mps)
+    ensure_venv
+    warn_sandbox
+    "${venv_python}" scripts/extension_probe.py --device mps
+    ;;
+  example)
+    ensure_venv
+    "${venv_python}" examples/gcn_mps_smoke.py
     ;;
   list)
     ensure_venv
@@ -131,6 +233,18 @@ Unknown stage: ${stage}
 
 Known stages:
   init
+  sync-sources
+  bootstrap
+  install-mps
+  install-local
+  install-local-pyg
+  install-local-pyg-lib
+  install-local-optionals
+  verify-mps
+  meta
+  extensions-cpu
+  extensions-mps
+  example
   list
   summary
   probe [name]

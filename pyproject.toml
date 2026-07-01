@@ -1,7 +1,7 @@
 [project]
 name = "pyg-macos-mps"
 version = "0.1.0"
-description = "Staged PyTorch Geometric MPS investigation workspace"
+description = "macOS/MPS compatibility probes and install workflow for PyTorch Geometric"
 requires-python = ">=3.12,<3.13"
 dependencies = []
 

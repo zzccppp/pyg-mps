@@ -1,0 +1,244 @@
+diff --git a/pyg_lib/csrc/ops/mps/scatter_kernel.cpp b/pyg_lib/csrc/ops/mps/scatter_kernel.cpp
+new file mode 100644
+index 0000000..cf61fc7
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/scatter_kernel.cpp
+@@ -0,0 +1,238 @@
++#include "../scatter.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++#include <limits>
++#include <tuple>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++int64_t normalize_dim(int64_t dim, int64_t rank, const char* name) {
++  dim = dim < 0 ? rank + dim : dim;
++  TORCH_CHECK(dim >= 0 && dim < rank, name, ": dim out of range");
++  return dim;
++}
++
++void check_scatter_inputs(const char* name,
++                          const at::Tensor& src,
++                          const at::Tensor& index) {
++  TORCH_CHECK(src.device().is_mps(), name, ": src must be an MPS tensor");
++  TORCH_CHECK(index.device().is_mps(),
++              name, ": index must be an MPS tensor");
++  TORCH_CHECK(src.device() == index.device(),
++              name, ": src and index must be on the same device");
++  TORCH_CHECK(src.dim() == index.dim(),
++              name, ": src.dim() must equal index.dim() "
++              "after broadcasting (got src.dim()=",
++              src.dim(), ", index.dim()=", index.dim(), ")");
++}
++
++std::vector<int64_t> output_sizes(const char* name,
++                                  const at::Tensor& src,
++                                  const at::Tensor& index,
++                                  int64_t dim,
++                                  std::optional<int64_t> dim_size) {
++  auto sizes = src.sizes().vec();
++  if (dim_size.has_value()) {
++    TORCH_CHECK(dim_size.value() >= 0, name,
++                ": dim_size must be non-negative");
++    sizes[dim] = dim_size.value();
++  } else if (index.numel() == 0) {
++    sizes[dim] = 0;
++  } else {
++    sizes[dim] = 1 + index.max().item<int64_t>();
++  }
++  return sizes;
++}
++
++void check_optional_out(const char* name,
++                        const at::Tensor& src,
++                        const at::Tensor& out,
++                        int64_t dim) {
++  TORCH_CHECK(out.device() == src.device(), name,
++              ": src and out must be on the same device");
++  TORCH_CHECK(out.dim() == src.dim(), name,
++              ": out.dim() must equal src.dim() (got out.dim()=", out.dim(),
++              ", src.dim()=", src.dim(), ")");
++  for (int64_t i = 0; i < out.dim(); ++i) {
++    if (i != dim) {
++      TORCH_CHECK(src.size(i) == out.size(i), name, ": out.size(", i,
++                  ") must match src.size(", i, ")");
++    }
++  }
++}
++
++at::Tensor scatter_sum_mps(const at::Tensor& src,
++                           const at::Tensor& index,
++                           int64_t dim,
++                           const std::optional<at::Tensor>& optional_out,
++                           std::optional<int64_t> dim_size) {
++  check_scatter_inputs("scatter_sum", src, index);
++
++  dim = normalize_dim(dim, src.dim(), "scatter_sum");
++
++  auto src_c = src.contiguous();
++  auto index_c = index.contiguous();
++
++  at::Tensor out;
++  if (optional_out.has_value()) {
++    const auto& optional = optional_out.value();
++    check_optional_out("scatter_sum", src_c, optional, dim);
++    out = optional.contiguous();
++  } else {
++    auto sizes = output_sizes("scatter_sum", src_c, index_c, dim, dim_size);
++    out = at::zeros(sizes, src_c.options());
++  }
++
++  if (src_c.numel() == 0) {
++    return out;
++  }
++
++  out.scatter_add_(dim, index_c, src_c);
++  return out;
++}
++
++at::Tensor scatter_mul_mps(const at::Tensor& src,
++                           const at::Tensor& index,
++                           int64_t dim,
++                           const std::optional<at::Tensor>& optional_out,
++                           std::optional<int64_t> dim_size) {
++  check_scatter_inputs("scatter_mul", src, index);
++
++  dim = normalize_dim(dim, src.dim(), "scatter_mul");
++
++  auto src_c = src.contiguous();
++  auto index_c = index.contiguous();
++
++  at::Tensor out;
++  if (optional_out.has_value()) {
++    const auto& optional = optional_out.value();
++    check_optional_out("scatter_mul", src_c, optional, dim);
++    out = optional.contiguous();
++  } else {
++    auto sizes = output_sizes("scatter_mul", src_c, index_c, dim, dim_size);
++    out = at::ones(sizes, src_c.options());
++  }
++
++  if (src_c.numel() == 0) {
++    return out;
++  }
++
++  out.scatter_reduce_(dim, index_c, src_c, "prod", true);
++  return out;
++}
++
++template <typename Fill>
++std::tuple<at::Tensor, at::Tensor> scatter_minmax_mps(
++    const char* name,
++    const char* reduce,
++    const at::Tensor& src,
++    const at::Tensor& index,
++    int64_t dim,
++    const std::optional<at::Tensor>& optional_out,
++    std::optional<int64_t> dim_size,
++    Fill fill) {
++  check_scatter_inputs(name, src, index);
++
++  dim = normalize_dim(dim, src.dim(), name);
++
++  auto src_c = src.contiguous();
++  auto index_c = index.contiguous();
++  const int64_t sentinel = src_c.size(dim);
++
++  at::Tensor out;
++  const bool out_was_provided = optional_out.has_value();
++  if (out_was_provided) {
++    const auto& optional = optional_out.value();
++    check_optional_out(name, src_c, optional, dim);
++    out = optional.contiguous();
++  } else {
++    auto sizes = output_sizes(name, src_c, index_c, dim, dim_size);
++    out = at::empty(sizes, src_c.options());
++    fill(out);
++  }
++
++  auto arg_out_cpu =
++      at::full(out.sizes(), sentinel,
++               index_c.options().device(at::kCPU).dtype(at::kLong));
++
++  if (src_c.numel() == 0) {
++    if (!out_was_provided) {
++      out.zero_();
++    }
++    return std::make_tuple(out, arg_out_cpu.to(index_c.device()));
++  }
++
++  out.scatter_reduce_(dim, index_c, src_c, reduce, true);
++
++  auto gathered = out.gather(dim, index_c);
++  auto src_cpu = src_c.cpu();
++  auto index_cpu = index_c.cpu();
++  auto gathered_cpu = gathered.cpu();
++  auto position_sizes = std::vector<int64_t>(src_c.dim(), 1);
++  position_sizes[dim] = src_c.size(dim);
++  auto positions = at::arange(src_c.size(dim),
++                              index_cpu.options().dtype(at::kLong))
++                       .reshape(position_sizes)
++                       .expand_as(index_cpu);
++  auto candidates = at::where(src_cpu.eq(gathered_cpu), positions,
++                              at::full_like(index_cpu, sentinel));
++  arg_out_cpu.scatter_reduce_(dim, index_cpu, candidates, "amin", true);
++
++  if (!out_was_provided) {
++    out.masked_fill_((arg_out_cpu == sentinel).to(out.device()), 0);
++  }
++
++  return std::make_tuple(out, arg_out_cpu.to(index_c.device()));
++}
++
++std::tuple<at::Tensor, at::Tensor> scatter_min_mps(
++    const at::Tensor& src,
++    const at::Tensor& index,
++    int64_t dim,
++    const std::optional<at::Tensor>& optional_out,
++    std::optional<int64_t> dim_size) {
++  return scatter_minmax_mps(
++      "scatter_min", "amin", src, index, dim, optional_out, dim_size,
++      [&](at::Tensor& out) {
++        AT_DISPATCH_ALL_TYPES_AND2(
++            at::ScalarType::Half, at::ScalarType::BFloat16, out.scalar_type(),
++            "scatter_min_mps_init_out",
++            [&] { out.fill_(std::numeric_limits<scalar_t>::max()); });
++      });
++}
++
++std::tuple<at::Tensor, at::Tensor> scatter_max_mps(
++    const at::Tensor& src,
++    const at::Tensor& index,
++    int64_t dim,
++    const std::optional<at::Tensor>& optional_out,
++    std::optional<int64_t> dim_size) {
++  return scatter_minmax_mps(
++      "scatter_max", "amax", src, index, dim, optional_out, dim_size,
++      [&](at::Tensor& out) {
++        AT_DISPATCH_ALL_TYPES_AND2(
++            at::ScalarType::Half, at::ScalarType::BFloat16, out.scalar_type(),
++            "scatter_max_mps_init_out",
++            [&] { out.fill_(std::numeric_limits<scalar_t>::lowest()); });
++      });
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_sum"),
++         TORCH_FN(scatter_sum_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_mul"),
++         TORCH_FN(scatter_mul_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_min"),
++         TORCH_FN(scatter_min_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_max"),
++         TORCH_FN(scatter_max_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg

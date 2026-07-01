@@ -1,0 +1,139 @@
+diff --git a/pyg_lib/csrc/ops/meta/scatter_kernel.cpp b/pyg_lib/csrc/ops/meta/scatter_kernel.cpp
+new file mode 100644
+index 0000000..d9f8f4e
+--- /dev/null
++++ b/pyg_lib/csrc/ops/meta/scatter_kernel.cpp
+@@ -0,0 +1,133 @@
++#include "../scatter.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++#include <tuple>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++int64_t normalize_dim(int64_t dim, int64_t rank, const char* name) {
++  dim = dim < 0 ? rank + dim : dim;
++  TORCH_CHECK(dim >= 0 && dim < rank, name, ": dim out of range");
++  return dim;
++}
++
++std::vector<int64_t> scatter_meta_sizes(
++    const char* name,
++    const at::Tensor& src,
++    const at::Tensor& index,
++    int64_t dim,
++    const std::optional<at::Tensor>& optional_out,
++    std::optional<int64_t> dim_size) {
++  TORCH_CHECK(src.dim() == index.dim(), name,
++              ": src.dim() must equal index.dim() after broadcasting "
++              "(got src.dim()=",
++              src.dim(), ", index.dim()=", index.dim(), ")");
++
++  dim = normalize_dim(dim, src.dim(), name);
++
++  if (optional_out.has_value()) {
++    const auto& out = optional_out.value();
++    TORCH_CHECK(out.dim() == src.dim(), name,
++                ": out.dim() must equal src.dim() (got out.dim()=",
++                out.dim(), ", src.dim()=", src.dim(), ")");
++    auto sizes = out.sizes().vec();
++    for (int64_t i = 0; i < out.dim(); ++i) {
++      if (i != dim) {
++        TORCH_CHECK(src.size(i) == out.size(i), name, ": out.size(", i,
++                    ") must match src.size(", i, ")");
++      }
++    }
++    return sizes;
++  }
++
++  auto sizes = src.sizes().vec();
++  if (dim_size.has_value()) {
++    TORCH_CHECK(dim_size.value() >= 0, name, ": dim_size must be non-negative");
++    sizes[dim] = dim_size.value();
++  } else if (index.numel() == 0) {
++    sizes[dim] = 0;
++  } else {
++    TORCH_CHECK(false, name,
++                ": Meta dispatch requires dim_size when out=None and index "
++                "is non-empty");
++  }
++  return sizes;
++}
++
++at::Tensor scatter_sum_meta(const at::Tensor& src,
++                            const at::Tensor& index,
++                            int64_t dim,
++                            const std::optional<at::Tensor>& optional_out,
++                            std::optional<int64_t> dim_size) {
++  auto sizes =
++      scatter_meta_sizes("scatter_sum", src, index, dim, optional_out, dim_size);
++  return at::empty(sizes, src.options());
++}
++
++at::Tensor scatter_mul_meta(const at::Tensor& src,
++                            const at::Tensor& index,
++                            int64_t dim,
++                            const std::optional<at::Tensor>& optional_out,
++                            std::optional<int64_t> dim_size) {
++  auto sizes =
++      scatter_meta_sizes("scatter_mul", src, index, dim, optional_out, dim_size);
++  return at::empty(sizes, src.options());
++}
++
++at::Tensor scatter_mean_meta(const at::Tensor& src,
++                             const at::Tensor& index,
++                             int64_t dim,
++                             const std::optional<at::Tensor>& optional_out,
++                             std::optional<int64_t> dim_size) {
++  auto sizes = scatter_meta_sizes(
++      "scatter_mean", src, index, dim, optional_out, dim_size);
++  return at::empty(sizes, src.options());
++}
++
++std::tuple<at::Tensor, at::Tensor> scatter_min_meta(
++    const at::Tensor& src,
++    const at::Tensor& index,
++    int64_t dim,
++    const std::optional<at::Tensor>& optional_out,
++    std::optional<int64_t> dim_size) {
++  auto sizes =
++      scatter_meta_sizes("scatter_min", src, index, dim, optional_out, dim_size);
++  auto out = at::empty(sizes, src.options());
++  auto arg_out = at::empty(sizes, index.options().dtype(at::kLong));
++  return std::make_tuple(out, arg_out);
++}
++
++std::tuple<at::Tensor, at::Tensor> scatter_max_meta(
++    const at::Tensor& src,
++    const at::Tensor& index,
++    int64_t dim,
++    const std::optional<at::Tensor>& optional_out,
++    std::optional<int64_t> dim_size) {
++  auto sizes =
++      scatter_meta_sizes("scatter_max", src, index, dim, optional_out, dim_size);
++  auto out = at::empty(sizes, src.options());
++  auto arg_out = at::empty(sizes, index.options().dtype(at::kLong));
++  return std::make_tuple(out, arg_out);
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, Meta, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_sum"),
++         TORCH_FN(scatter_sum_meta));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_mul"),
++         TORCH_FN(scatter_mul_meta));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_mean"),
++         TORCH_FN(scatter_mean_meta));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_min"),
++         TORCH_FN(scatter_min_meta));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::scatter_max"),
++         TORCH_FN(scatter_max_meta));
++}
++
++}  // namespace ops
++}  // namespace pyg
