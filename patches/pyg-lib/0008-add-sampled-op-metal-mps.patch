@@ -1,0 +1,257 @@
+diff --git a/pyg_lib/csrc/ops/mps/sampled_metal.mm b/pyg_lib/csrc/ops/mps/sampled_metal.mm
+new file mode 100644
+index 0000000..dfead2a
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/sampled_metal.mm
+@@ -0,0 +1,251 @@
++// Native MPS support for `sampled_op` (sampled_add/sub/mul/div) via a fused
++// gather+arith Metal kernel.
++//
++// `sampled_op` computes, for 2-D `left [Nl, F]` / `right [Nr, F]`:
++//   a = left_index  ? left[left_index]   : left     # [M, F]
++//   b = right_index ? right[right_index] : right     # [M, F]
++//   out = a (+|-|*|/) b                              # [M, F]
++// The reference path materializes the two gathered intermediates and then runs
++// an elementwise op (two index_selects + one binary kernel). This fuses all of
++// it into a single pass: each thread owns one output cell `(m, f)`, resolves the
++// two source rows on the fly, reads one element from each operand, and writes the
++// result -- no intermediate `a`/`b` tensors, one kernel launch.
++//
++// f16/bf16 are promoted to float and rounded once on store, so a single binary
++// op is bit-identical to the half-precision reference. The kernel covers the hot
++// path (2-D contiguous operands, f32/f16/bf16, 1-D int64 indices, output fits in
++// 32-bit counters); anything else falls back to a native on-device index_select
++// composite (still no CPU round-trip).
++
++#include "../sampled.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++#import <Foundation/Foundation.h>
++#import <Metal/Metal.h>
++#include <torch/mps.h>
++
++#include <limits>
++#include <string>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++static const char* kShaderSrc = R"METAL(
++#include <metal_stdlib>
++using namespace metal;
++
++inline float to_float(float v)  { return v; }
++inline float to_float(half v)   { return float(v); }
++inline float to_float(ushort v) { return as_type<float>(uint(v) << 16); }
++inline void store_out(device float* p, uint i, float v)  { p[i] = v; }
++inline void store_out(device half* p, uint i, float v)   { p[i] = half(v); }
++inline void store_out(device ushort* p, uint i, float v) { p[i] = ushort(as_type<uint>(v) >> 16); }
++
++// op: 0=add, 1=sub, 2=mul, 3=div
++template <typename T>
++inline void sampled_impl(device const T* left, device const T* right,
++                         device const long* li, device const long* ri,
++                         device T* out, uint M, uint F, uint has_li,
++                         uint has_ri, uint op, uint gid) {
++    if (gid >= M * F) return;
++    uint m = gid / F;
++    uint f = gid % F;
++    uint lrow = (has_li != 0u) ? (uint)li[m] : m;
++    uint rrow = (has_ri != 0u) ? (uint)ri[m] : m;
++    float a = to_float(left[lrow * F + f]);
++    float b = to_float(right[rrow * F + f]);
++    float r = (op == 0u) ? (a + b)
++            : (op == 1u) ? (a - b)
++            : (op == 2u) ? (a * b)
++                         : (a / b);
++    store_out(out, gid, r);
++}
++
++#define SAMPLED_K(NAME, T)                                     \
++  kernel void NAME(device const T* left [[buffer(0)]],         \
++                   device const T* right [[buffer(1)]],        \
++                   device const long* li [[buffer(2)]],        \
++                   device const long* ri [[buffer(3)]],        \
++                   device T* out [[buffer(4)]],                \
++                   constant uint& M [[buffer(5)]],             \
++                   constant uint& F [[buffer(6)]],             \
++                   constant uint& has_li [[buffer(7)]],        \
++                   constant uint& has_ri [[buffer(8)]],        \
++                   constant uint& op [[buffer(9)]],            \
++                   uint gid [[thread_position_in_grid]]) {     \
++    sampled_impl(left, right, li, ri, out, M, F, has_li, has_ri, op, gid); \
++  }
++
++SAMPLED_K(sampled_f32, float)
++SAMPLED_K(sampled_f16, half)
++SAMPLED_K(sampled_bf16, ushort)
++)METAL";
++
++constexpr int kNumDtypes = 3;
++
++struct MetalSampled {
++  id<MTLComputePipelineState> pso[kNumDtypes] = {nil, nil, nil};
++  bool ok = false;
++};
++
++id<MTLComputePipelineState> make_pso(id<MTLDevice> dev, id<MTLLibrary> lib,
++                                     NSString* name) {
++  id<MTLFunction> fn = [lib newFunctionWithName:name];
++  if (!fn) return nil;
++  NSError* err = nil;
++  return [dev newComputePipelineStateWithFunction:fn error:&err];
++}
++
++const MetalSampled& metal_sampled() {
++  static MetalSampled state = [] {
++    MetalSampled s;
++    @autoreleasepool {
++      id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
++      if (!dev) return s;
++      NSError* err = nil;
++      id<MTLLibrary> lib = [dev
++          newLibraryWithSource:[NSString stringWithUTF8String:kShaderSrc]
++                       options:nil
++                         error:&err];
++      if (!lib) return s;
++      NSString* names[kNumDtypes] = {@"sampled_f32", @"sampled_f16",
++                                     @"sampled_bf16"};
++      for (int i = 0; i < kNumDtypes; ++i) {
++        s.pso[i] = make_pso(dev, lib, names[i]);
++        if (!s.pso[i]) return s;
++      }
++      s.ok = true;
++    }
++    return s;
++  }();
++  return state;
++}
++
++int dtype_index(at::ScalarType t) {
++  switch (t) {
++    case at::kFloat: return 0;
++    case at::kHalf: return 1;
++    case at::kBFloat16: return 2;
++    default: return -1;
++  }
++}
++
++int op_index(const std::string& fn) {
++  if (fn == "add") return 0;
++  if (fn == "sub") return 1;
++  if (fn == "mul") return 2;
++  if (fn == "div") return 3;
++  return -1;
++}
++
++static inline id<MTLBuffer> mtl_buffer(const at::Tensor& t) {
++  return __builtin_bit_cast(id<MTLBuffer>, t.storage().data());
++}
++static inline NSUInteger byte_offset(const at::Tensor& t) {
++  return (NSUInteger)(t.storage_offset() * t.element_size());
++}
++
++bool index_ok(const std::optional<at::Tensor>& idx) {
++  return !idx.has_value() ||
++         (idx->dim() == 1 && idx->scalar_type() == at::kLong);
++}
++
++bool sampled_eligible(const at::Tensor& left,
++                      const at::Tensor& right,
++                      const std::optional<at::Tensor>& li,
++                      const std::optional<at::Tensor>& ri,
++                      int op,
++                      int64_t M) {
++  const int64_t u32 = std::numeric_limits<uint32_t>::max();
++  // When an operand has no index, the fused kernel reads row `m` directly, so
++  // that operand must have exactly M rows (otherwise CPU would broadcast --
++  // defer to the composite, which honors broadcast semantics).
++  const bool rows_ok = (li.has_value() || left.size(0) == M) &&
++                       (ri.has_value() || right.size(0) == M);
++  return metal_sampled().ok && op >= 0 && left.dim() == 2 &&
++         right.dim() == 2 && dtype_index(left.scalar_type()) >= 0 &&
++         left.scalar_type() == right.scalar_type() && index_ok(li) &&
++         index_ok(ri) && rows_ok && M * left.size(1) <= u32;
++}
++
++// Native on-device fallback: materialize the gathered operands and apply the op.
++at::Tensor sampled_composite(const at::Tensor& left,
++                             const at::Tensor& right,
++                             const std::optional<at::Tensor>& li,
++                             const std::optional<at::Tensor>& ri,
++                             const std::string& fn) {
++  auto a = li.has_value() ? left.index_select(0, li->contiguous()) : left;
++  auto b = ri.has_value() ? right.index_select(0, ri->contiguous()) : right;
++  if (fn == "add") return a + b;
++  if (fn == "sub") return a - b;
++  if (fn == "mul") return a * b;
++  return a / b;
++}
++
++at::Tensor sampled_op_mps(const at::Tensor& left,
++                          const at::Tensor& right,
++                          const std::optional<at::Tensor> left_index,
++                          const std::optional<at::Tensor> right_index,
++                          const std::string fn) {
++  const int op = op_index(fn);
++  // Output row count M: length of an index if provided, else the operand rows.
++  const int64_t M = left_index.has_value()  ? left_index->size(0)
++                    : right_index.has_value() ? right_index->size(0)
++                                              : left.size(0);
++  if (!sampled_eligible(left, right, left_index, right_index, op, M)) {
++    return sampled_composite(left, right, left_index, right_index, fn);
++  }
++
++  auto left_c = left.contiguous();
++  auto right_c = right.contiguous();
++  const uint32_t Mu = (uint32_t)M;
++  const uint32_t F = (uint32_t)left_c.size(1);
++  const uint32_t has_li = left_index.has_value() ? 1u : 0u;
++  const uint32_t has_ri = right_index.has_value() ? 1u : 0u;
++  const uint32_t opu = (uint32_t)op;
++
++  // A real int64 buffer must back each index slot; reuse left's buffer as an
++  // (unread) filler when an index is absent.
++  auto li_c = left_index.has_value() ? left_index->contiguous() : left_c;
++  auto ri_c = right_index.has_value() ? right_index->contiguous() : left_c;
++
++  auto out = at::empty({(int64_t)Mu, (int64_t)F}, left_c.options());
++  const uint32_t total = Mu * F;
++  auto pso = metal_sampled().pso[dtype_index(left_c.scalar_type())];
++  @autoreleasepool {
++    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
++    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
++      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++      [enc setComputePipelineState:pso];
++      [enc setBuffer:mtl_buffer(left_c) offset:byte_offset(left_c) atIndex:0];
++      [enc setBuffer:mtl_buffer(right_c) offset:byte_offset(right_c) atIndex:1];
++      [enc setBuffer:mtl_buffer(li_c) offset:byte_offset(li_c) atIndex:2];
++      [enc setBuffer:mtl_buffer(ri_c) offset:byte_offset(ri_c) atIndex:3];
++      [enc setBuffer:mtl_buffer(out) offset:0 atIndex:4];
++      [enc setBytes:&Mu length:sizeof(Mu) atIndex:5];
++      [enc setBytes:&F length:sizeof(F) atIndex:6];
++      [enc setBytes:&has_li length:sizeof(has_li) atIndex:7];
++      [enc setBytes:&has_ri length:sizeof(has_ri) atIndex:8];
++      [enc setBytes:&opu length:sizeof(opu) atIndex:9];
++      NSUInteger tg = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup,
++                          (NSUInteger)total);
++      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
++          threadsPerThreadgroup:MTLSizeMake(MAX(tg, (NSUInteger)1), 1, 1)];
++      [enc endEncoding];
++      torch::mps::commit();
++    });
++  }
++  return out;
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::sampled_op"), TORCH_FN(sampled_op_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg
