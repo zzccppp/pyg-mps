@@ -65,13 +65,15 @@ uv pip install --no-build-isolation src/pyg-lib   # non-editable! (see gotchas)
 | `segment_{sum,mean,min,max}_csr`, `gather_csr` | **native (Metal)** | **Dedicated atomic-free per-row Metal kernel** (`mps/segment_csr_metal.mm`); `gather_csr`=`repeat_interleave`+`index_select` |
 | `index_sort` | native | already worked on MPS |
 | knn/radius/nearest/fps/grid_cluster, spline_* | CPU-assisted | shims in `mps/point_cloud_kernel.cpp`, `mps/spline_kernel.cpp` |
-| **`softmax_csr`** | **TODO** | composite on CSR reduce (max→sub→exp→sum→div) |
+| `softmax_csr` (+ backward) | **native (composite)** | On-device composite over the CSR kernels (`mps/softmax_csr_kernel.cpp`): `segment_max_csr`→`gather_csr`→exp→`segment_sum_csr`→`gather_csr`→divide. Mirrors CPU max→sub→exp→sum→div (singleton→1.0, empty→no output); hot path `dim==0`/1-D `ptr`/f32-f16-bf16, else CPU fallback. ~11.5× vs naive-tensor MPS, ~12.6× vs CPU at 1M edges. |
 | **`sampled_add/sub/mul/div`** | **TODO** | small fused gather+arith Metal kernel |
 | **`grouped_matmul` / `segment_matmul`** | **TODO** | batched/looped MPS matmul (heterogeneous GNNs) |
 
 All implemented ops have **exact value+arg parity** vs the CPU kernel (incl.
 empty segments, ties, f32/f16/bf16): `tests/test_scatter_parity.py` (58),
-`tests/test_segment_parity.py` (24). Benchmarks + charts in `benchmarks/`.
+`tests/test_segment_parity.py` (24), `tests/test_softmax_parity.py` (7,
+forward+backward+row-sum+singleton+fallback). Benchmarks + charts in
+`benchmarks/` (softmax: `scripts/benchmark_softmax.py`).
 
 ## Key source files (in `src/pyg-lib/pyg_lib/csrc/ops/`)
 
@@ -109,7 +111,8 @@ gh run list --repo zzccppp/pyg-lib --limit 3        # CI status
 ```
 
 ## Next steps (priority order)
-1. **`softmax_csr`** — native composite over the CSR reduction.
+1. ~~`softmax_csr` — native composite over the CSR reduction.~~ **DONE**
+   (`mps/softmax_csr_kernel.cpp`, patch `0007`, fork commit `cee9e29`).
 2. **`sampled_add/sub/mul/div`** — fused gather+arith Metal kernel.
 3. **`grouped_matmul` / `segment_matmul`** — batched MPS matmul.
 4. After a batch of new ops: bump version, tag `v0.8.2-mps` (CI auto-builds wheels).

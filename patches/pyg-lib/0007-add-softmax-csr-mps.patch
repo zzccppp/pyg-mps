@@ -1,0 +1,85 @@
+diff --git a/pyg_lib/csrc/ops/mps/softmax_csr_kernel.cpp b/pyg_lib/csrc/ops/mps/softmax_csr_kernel.cpp
+new file mode 100644
+index 0000000..a3f44bc
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/softmax_csr_kernel.cpp
+@@ -0,0 +1,79 @@
++// Native MPS support for `softmax_csr` / `softmax_csr_backward` via a composite
++// over the already-native CSR reduction + gather kernels.
++//
++// A CSR softmax normalizes `src` within each compressed row `[ptr[r], ptr[r+1])`
++// along `dim = 0`:
++//   m   = segment_max_csr(src)              # per-row max,  shape [N, H]
++//   s   = exp(src - gather_csr(m))          # shifted,      shape [E, H]
++//   out = s / gather_csr(segment_sum_csr(s))
++// Every hop dispatches to the native/Metal MPS kernel, so the whole op stays on
++// the GPU with no new shader. This mirrors the CPU kernel's max->sub->exp->sum->
++// div math exactly: a singleton row collapses to `exp(0)/exp(0) = 1.0`, and an
++// empty row contributes no output positions.
++//
++// Backward mirrors the CPU kernel:
++//   g       = segment_sum_csr(out * out_grad)
++//   in_grad = out * (out_grad - gather_csr(g))
++//
++// The composite covers the hot path (`dim == 0`, 1-D `ptr`, f32/f16/bf16). The
++// component CSR/gather kernels each fall back internally when their own fast
++// path does not apply, so the result is always correct and stays on-device.
++// Non-hot layouts (`dim != 0`, a multi-dim `ptr`) fall back to the CPU kernel.
++
++#include "../segment_csr.h"
++#include "../softmax.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++namespace pyg {
++namespace ops {
++namespace {
++
++bool softmax_eligible(const at::Tensor& src,
++                      const at::Tensor& ptr,
++                      const int64_t dim) {
++  return dim == 0 && ptr.dim() == 1 &&
++         (src.scalar_type() == at::kFloat || src.scalar_type() == at::kHalf ||
++          src.scalar_type() == at::kBFloat16);
++}
++
++at::Tensor softmax_csr_mps(const at::Tensor& src,
++                           const at::Tensor& ptr,
++                           const int64_t dim) {
++  if (!softmax_eligible(src, ptr, dim)) {
++    return softmax_csr(src.cpu(), ptr.cpu(), dim).to(src.device());
++  }
++  auto src_c = src.contiguous();
++  // max -> subtract (numerical stability) -> exp
++  auto max = std::get<0>(segment_max_csr(src_c, ptr));  // [N, H]
++  auto shifted = (src_c - gather_csr(max, ptr)).exp();   // [E, H]
++  // sum -> normalize
++  auto sum = segment_sum_csr(shifted, ptr);              // [N, H]
++  return shifted / gather_csr(sum, ptr);                 // [E, H]
++}
++
++at::Tensor softmax_csr_backward_mps(const at::Tensor& out,
++                                    const at::Tensor& out_grad,
++                                    const at::Tensor& ptr,
++                                    const int64_t dim) {
++  if (!softmax_eligible(out, ptr, dim)) {
++    return softmax_csr_backward(out.cpu(), out_grad.cpu(), ptr.cpu(), dim)
++        .to(out.device());
++  }
++  auto out_c = out.contiguous();
++  auto out_grad_c = out_grad.contiguous();
++  auto g = segment_sum_csr(out_c * out_grad_c, ptr);     // [N, H]
++  return out_c * (out_grad_c - gather_csr(g, ptr));      // [E, H]
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::softmax_csr"), TORCH_FN(softmax_csr_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::softmax_csr_backward"),
++         TORCH_FN(softmax_csr_backward_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg
