@@ -1,0 +1,103 @@
+diff --git a/pyg_lib/csrc/ops/mps/matmul_kernel.cpp b/pyg_lib/csrc/ops/mps/matmul_kernel.cpp
+new file mode 100644
+index 0000000..8ebe97e
+--- /dev/null
++++ b/pyg_lib/csrc/ops/mps/matmul_kernel.cpp
+@@ -0,0 +1,97 @@
++// Native MPS support for `grouped_matmul` / `segment_matmul`.
++//
++// Both ops are heterogeneous batched matmuls. PyTorch's `at::matmul` / `at::mm`
++// / `at::bmm` already dispatch to Apple's optimized MPS GEMM, so the native MPS
++// path is a thin layer that shapes the work for those kernels -- no new Metal
++// shader.
++//
++//   grouped_matmul(input[], other[]) -> out[]:  out[i] = input[i] @ other[i]
++//     (independent matmuls, possibly all different shapes). A per-pair loop,
++//     each hop a native MPS GEMM.
++//
++//   segment_matmul(input[Σm, K], ptr[G+1], other[G, K, N]) -> out[Σm, N]:
++//     segment i multiplies rows [ptr[i], ptr[i+1]) of `input` by `other[i]`.
++//     All segments share K and N; only the row count m_i varies.
++//       * Uniform fast path: when every segment has the same m > 0, `input`
++//         reshapes to [G, m, K] and a single `bmm` against [G, K, N] produces
++//         [G, m, N] -- one batched MPS matmul, zero-copy views in and out.
++//       * General path: per-segment `mm_out` into the matching output rows.
++//
++// Backward composes `segment/grouped_matmul` + `matmul`/`stack` (all native on
++// MPS), so it works automatically once these forwards are registered.
++
++#include "../matmul.h"
++
++#include <ATen/ATen.h>
++#include <torch/library.h>
++
++#include <vector>
++
++#include "pyg_lib/csrc/utils/convert.h"
++
++namespace pyg {
++namespace ops {
++namespace {
++
++std::vector<at::Tensor> grouped_matmul_mps(const at::TensorList input,
++                                           const at::TensorList other) {
++  std::vector<at::Tensor> out;
++  out.reserve(input.size());
++  for (size_t i = 0; i < input.size(); ++i) {
++    out.emplace_back(at::matmul(input[i].contiguous(), other[i].contiguous()));
++  }
++  return out;
++}
++
++at::Tensor segment_matmul_mps(const at::Tensor& input,
++                              const at::Tensor& ptr,
++                              const at::Tensor& other) {
++  const auto input_c = input.contiguous();
++  const auto other_c = other.contiguous();
++  const int64_t G = other_c.size(0);
++  const int64_t K = other_c.size(1);
++  const int64_t N = other_c.size(2);
++
++  // Segment row counts (on CPU so we can branch / index host-side).
++  const auto size = pyg::utils::size_from_ptr(ptr).cpu();
++  const auto* sizes = size.data_ptr<int64_t>();
++
++  auto out = input_c.new_empty({input_c.size(0), N});
++
++  // Uniform fast path: all segments share the same positive row count -> a
++  // single batched matmul over zero-copy [G, m, *] views.
++  bool uniform = G > 0 && sizes[0] > 0 && input_c.size(0) == G * sizes[0];
++  for (int64_t i = 0; uniform && i < G; ++i) {
++    uniform = sizes[i] == sizes[0];
++  }
++  if (uniform) {
++    const int64_t m = sizes[0];
++    auto in3 = input_c.view({G, m, K});
++    auto out3 = out.view({G, m, N});
++    at::bmm_out(out3, in3, other_c);
++    return out;
++  }
++
++  // General path: one native MPS GEMM per (non-empty) segment.
++  int64_t offset = 0;
++  for (int64_t i = 0; i < G; ++i) {
++    const int64_t m = sizes[i];
++    if (m == 0) continue;
++    auto out_i = out.narrow(0, offset, m);
++    at::mm_out(out_i, input_c.narrow(0, offset, m), other_c.select(0, i));
++    offset += m;
++  }
++  return out;
++}
++
++}  // namespace
++
++TORCH_LIBRARY_IMPL(pyg, MPS, m) {
++  m.impl(TORCH_SELECTIVE_NAME("pyg::grouped_matmul"),
++         TORCH_FN(grouped_matmul_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::segment_matmul"),
++         TORCH_FN(segment_matmul_mps));
++}
++
++}  // namespace ops
++}  // namespace pyg

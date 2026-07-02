@@ -1,0 +1,181 @@
+{
+  "meta": {
+    "torch_version": "2.12.1",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "dtype": "torch.float32",
+    "rows_per_seg": 128,
+    "K": 64,
+    "N": 64,
+    "warmup": 10,
+    "iters": 50,
+    "devices": [
+      "mps",
+      "cpu"
+    ]
+  },
+  "results": [
+    {
+      "op": "segment_matmul",
+      "device": "mps",
+      "segments": 8,
+      "rows_per_seg": 128,
+      "ms_median": 0.3522085025906563,
+      "ms_mean": 0.4400626290589571,
+      "ms_stdev": 0.19091202002331228
+    },
+    {
+      "op": "segment_matmul_loop_mps",
+      "device": "mps",
+      "segments": 8,
+      "rows_per_seg": 128,
+      "ms_median": 0.46562450006604195,
+      "ms_mean": 0.47552410513162613,
+      "ms_stdev": 0.03320252502021546
+    },
+    {
+      "op": "segment_matmul",
+      "device": "cpu",
+      "segments": 8,
+      "rows_per_seg": 128,
+      "ms_median": 0.02989545464515686,
+      "ms_mean": 0.02957744523882866,
+      "ms_stdev": 0.0011671630196996112
+    },
+    {
+      "op": "segment_matmul",
+      "device": "mps",
+      "segments": 16,
+      "rows_per_seg": 128,
+      "ms_median": 0.30908361077308655,
+      "ms_mean": 0.31580911949276924,
+      "ms_stdev": 0.01871625038313075
+    },
+    {
+      "op": "segment_matmul_loop_mps",
+      "device": "mps",
+      "segments": 16,
+      "rows_per_seg": 128,
+      "ms_median": 0.6417920812964439,
+      "ms_mean": 0.6487582717090845,
+      "ms_stdev": 0.03257936227123644
+    },
+    {
+      "op": "segment_matmul",
+      "device": "cpu",
+      "segments": 16,
+      "rows_per_seg": 128,
+      "ms_median": 0.05495850928127766,
+      "ms_mean": 0.05509820766746998,
+      "ms_stdev": 0.0016280493566723981
+    },
+    {
+      "op": "segment_matmul",
+      "device": "mps",
+      "segments": 32,
+      "rows_per_seg": 128,
+      "ms_median": 0.35604159347712994,
+      "ms_mean": 0.3530365228652954,
+      "ms_stdev": 0.02225390607623789
+    },
+    {
+      "op": "segment_matmul_loop_mps",
+      "device": "mps",
+      "segments": 32,
+      "rows_per_seg": 128,
+      "ms_median": 0.7548124995082617,
+      "ms_mean": 0.7848674617707729,
+      "ms_stdev": 0.09542812479162607
+    },
+    {
+      "op": "segment_matmul",
+      "device": "cpu",
+      "segments": 32,
+      "rows_per_seg": 128,
+      "ms_median": 0.10445807129144669,
+      "ms_mean": 0.10377667844295502,
+      "ms_stdev": 0.0019858047998665414
+    },
+    {
+      "op": "segment_matmul",
+      "device": "mps",
+      "segments": 64,
+      "rows_per_seg": 128,
+      "ms_median": 0.4010419361293316,
+      "ms_mean": 0.40457419119775295,
+      "ms_stdev": 0.018815676736001964
+    },
+    {
+      "op": "segment_matmul_loop_mps",
+      "device": "mps",
+      "segments": 64,
+      "rows_per_seg": 128,
+      "ms_median": 1.5016039833426476,
+      "ms_mean": 1.6273091826587915,
+      "ms_stdev": 0.20010569218867297
+    },
+    {
+      "op": "segment_matmul",
+      "device": "cpu",
+      "segments": 64,
+      "rows_per_seg": 128,
+      "ms_median": 0.19389553926885128,
+      "ms_mean": 0.19501907750964165,
+      "ms_stdev": 0.003025870898976261
+    },
+    {
+      "op": "segment_matmul",
+      "device": "mps",
+      "segments": 128,
+      "rows_per_seg": 128,
+      "ms_median": 0.5161664448678493,
+      "ms_mean": 0.5164199601858854,
+      "ms_stdev": 0.019184836619094762
+    },
+    {
+      "op": "segment_matmul_loop_mps",
+      "device": "mps",
+      "segments": 128,
+      "rows_per_seg": 128,
+      "ms_median": 2.5154375471174717,
+      "ms_mean": 2.5248365476727486,
+      "ms_stdev": 0.12404745109047148
+    },
+    {
+      "op": "segment_matmul",
+      "device": "cpu",
+      "segments": 128,
+      "rows_per_seg": 128,
+      "ms_median": 0.4009585827589035,
+      "ms_mean": 0.4012800566852093,
+      "ms_stdev": 0.005923801681340386
+    },
+    {
+      "op": "segment_matmul",
+      "device": "mps",
+      "segments": 256,
+      "rows_per_seg": 128,
+      "ms_median": 0.43120793998241425,
+      "ms_mean": 0.4353916458785534,
+      "ms_stdev": 0.028348989324212894
+    },
+    {
+      "op": "segment_matmul_loop_mps",
+      "device": "mps",
+      "segments": 256,
+      "rows_per_seg": 128,
+      "ms_median": 4.869083408266306,
+      "ms_mean": 4.886301625519991,
+      "ms_stdev": 0.24129973003663843
+    },
+    {
+      "op": "segment_matmul",
+      "device": "cpu",
+      "segments": 256,
+      "rows_per_seg": 128,
+      "ms_median": 0.7997914217412472,
+      "ms_mean": 0.8037816174328327,
+      "ms_stdev": 0.025416529242087878
+    }
+  ]
+}
