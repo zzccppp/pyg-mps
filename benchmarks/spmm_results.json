@@ -1,0 +1,162 @@
+{
+  "meta": {
+    "torch_version": "2.12.1",
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "dtype": "torch.float32",
+    "feature_dim": 128,
+    "fanout": 10,
+    "warmup": 10,
+    "iters": 50,
+    "devices": [
+      "mps",
+      "cpu"
+    ]
+  },
+  "results": [
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "mps",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 8.548312587663531,
+      "ms_mean": 8.626145804300904,
+      "ms_stdev": 0.27439638353645207
+    },
+    {
+      "op": "gather+segment_csr",
+      "device": "mps",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 1.5237294137477875,
+      "ms_mean": 1.5294983889907598,
+      "ms_stdev": 0.028839473150236217
+    },
+    {
+      "op": "spmm_csr (fused)",
+      "device": "mps",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 0.3074789419770241,
+      "ms_mean": 0.31083159148693085,
+      "ms_stdev": 0.014845620987234258
+    },
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "cpu",
+      "edges": 100000,
+      "nodes": 10000,
+      "ms_median": 2.506916644051671,
+      "ms_mean": 2.7116067055612803,
+      "ms_stdev": 0.44713167504889034
+    },
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "mps",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 46.3037914596498,
+      "ms_mean": 46.37699990533292,
+      "ms_stdev": 0.3512340709533623
+    },
+    {
+      "op": "gather+segment_csr",
+      "device": "mps",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 7.615832844749093,
+      "ms_mean": 7.641161624342203,
+      "ms_stdev": 0.09203935388418372
+    },
+    {
+      "op": "spmm_csr (fused)",
+      "device": "mps",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 1.0888546239584684,
+      "ms_mean": 1.1023475136607885,
+      "ms_stdev": 0.050047800055439
+    },
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "cpu",
+      "edges": 500000,
+      "nodes": 50000,
+      "ms_median": 13.351479079574347,
+      "ms_mean": 15.047121746465564,
+      "ms_stdev": 3.16520873578701
+    },
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "mps",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 98.81589584983885,
+      "ms_mean": 98.85067906230688,
+      "ms_stdev": 0.5451154841824623
+    },
+    {
+      "op": "gather+segment_csr",
+      "device": "mps",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 15.920812264084816,
+      "ms_mean": 15.933102490380406,
+      "ms_stdev": 0.12047397642843942
+    },
+    {
+      "op": "spmm_csr (fused)",
+      "device": "mps",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 2.0933544728904963,
+      "ms_mean": 2.114297514781356,
+      "ms_stdev": 0.051346039532566695
+    },
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "cpu",
+      "edges": 1000000,
+      "nodes": 100000,
+      "ms_median": 27.987603796646,
+      "ms_mean": 30.111566772684455,
+      "ms_stdev": 4.955545056391804
+    },
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "mps",
+      "edges": 2000000,
+      "nodes": 200000,
+      "ms_median": 202.74022896774113,
+      "ms_mean": 202.8285791259259,
+      "ms_stdev": 0.608310997221771
+    },
+    {
+      "op": "gather+segment_csr",
+      "device": "mps",
+      "edges": 2000000,
+      "nodes": 200000,
+      "ms_median": 32.007833709940314,
+      "ms_mean": 31.975237540900707,
+      "ms_stdev": 0.1868915114438106
+    },
+    {
+      "op": "spmm_csr (fused)",
+      "device": "mps",
+      "edges": 2000000,
+      "nodes": 200000,
+      "ms_median": 4.510104656219482,
+      "ms_mean": 4.514486603438854,
+      "ms_stdev": 0.07183825705092423
+    },
+    {
+      "op": "scatter_add (PyG path)",
+      "device": "cpu",
+      "edges": 2000000,
+      "nodes": 200000,
+      "ms_median": 59.76668721996248,
+      "ms_mean": 65.37587588652968,
+      "ms_stdev": 10.487107819089665
+    }
+  ]
+}
