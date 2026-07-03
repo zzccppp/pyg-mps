@@ -85,6 +85,45 @@ def test_spmm_csr_matches_cpu_kernel() -> None:
         torch.testing.assert_close(got, ref, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize("dtype", _DTYPES)
+def test_spmm_max_csr_value_and_arg(dtype: torch.dtype) -> None:
+    """Max SpMM: value matches a scatter-amax reference; arg picks the winner."""
+    torch.manual_seed(2)
+    n, e, f = 600, 9_000, 24
+    indptr, col, deg = _csr(e, n)
+    x = (torch.randn(n, f) * 0.5).to(dtype)
+
+    out, arg = ops.spmm_max_csr(x.to("mps"), indptr.to("mps"), col.to("mps"), None)
+    ref = _reference(x, indptr, col, None, "max")
+    assert out.device.type == "mps" and arg.device.type == "mps"
+    assert arg.dtype == torch.long and arg.shape == (n, f)
+    tol = ({"rtol": 1e-4, "atol": 1e-4} if dtype == torch.float32
+           else {"rtol": 3e-2, "atol": 3e-2})
+    torch.testing.assert_close(out.float().cpu(), ref, **tol)
+
+    # arg consistency: for non-empty rows, x[arg] equals the reported max value.
+    arg_c = arg.cpu()
+    valid = arg_c < n
+    gathered = torch.gather(x.float(), 0, arg_c.clamp(max=n - 1))
+    torch.testing.assert_close(gathered[valid], out.float().cpu()[valid],
+                               rtol=1e-3, atol=1e-3)
+    # empty rows -> sentinel arg == n and value 0
+    empty = deg == 0
+    if empty.any():
+        assert (arg_c[empty] == n).all()
+
+
+def test_spmm_max_csr_matches_cpu_kernel() -> None:
+    torch.manual_seed(3)
+    indptr, col, _ = _csr(15_000, 800)
+    x = torch.randn(800, 16)
+    o_mps, a_mps = ops.spmm_max_csr(x.to("mps"), indptr.to("mps"),
+                                    col.to("mps"), None)
+    o_cpu, a_cpu = ops.spmm_max_csr(x, indptr, col, None)
+    torch.testing.assert_close(o_mps.cpu(), o_cpu, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(a_mps.cpu(), a_cpu, rtol=0, atol=0)
+
+
 def test_spmm_csr_all_empty_rows() -> None:
     """A graph with no edges yields an all-zero output."""
     n, f = 10, 4

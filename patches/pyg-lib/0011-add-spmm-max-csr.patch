@@ -1,0 +1,345 @@
+diff --git a/pyg_lib/csrc/ops/cpu/spmm_kernel.cpp b/pyg_lib/csrc/ops/cpu/spmm_kernel.cpp
+index 6603c34..3843449 100644
+--- a/pyg_lib/csrc/ops/cpu/spmm_kernel.cpp
++++ b/pyg_lib/csrc/ops/cpu/spmm_kernel.cpp
+@@ -3,6 +3,7 @@
+ #include <torch/library.h>
+ 
+ #include <limits>
++#include <tuple>
+ 
+ namespace pyg {
+ namespace ops {
+@@ -67,10 +68,68 @@ at::Tensor spmm_csr_kernel(const at::Tensor& x,
+   return out;
+ }
+ 
++// out[i, f] = max_e weight[e] * x[col[e], f];  arg[i, f] = col[e*] (first max).
++// Empty rows: value 0, arg = x.size(0).
++std::tuple<at::Tensor, at::Tensor> spmm_max_csr_kernel(
++    const at::Tensor& x,
++    const at::Tensor& indptr,
++    const at::Tensor& col,
++    const std::optional<at::Tensor>& weight) {
++  const auto x_c = x.contiguous();
++  const auto indptr_c = indptr.contiguous();
++  const auto col_c = col.contiguous();
++  const auto N = indptr_c.size(0) - 1;
++  const auto F = x_c.size(1);
++  const int64_t sentinel = x_c.size(0);
++  auto out = at::zeros({N, F}, x_c.options());
++  auto arg = at::full({N, F}, sentinel, indptr_c.options());
++
++  const bool has_w = weight.has_value();
++  const auto w_c = has_w ? weight.value().contiguous() : at::Tensor();
++
++  AT_DISPATCH_FLOATING_TYPES_AND2(
++      at::kHalf, at::kBFloat16, x_c.scalar_type(), "spmm_max_csr_kernel", [&] {
++        const auto* ip = indptr_c.data_ptr<int64_t>();
++        const auto* cl = col_c.data_ptr<int64_t>();
++        const auto* xp = x_c.data_ptr<scalar_t>();
++        auto* op = out.data_ptr<scalar_t>();
++        auto* ap = arg.data_ptr<int64_t>();
++        const scalar_t* wp = has_w ? w_c.data_ptr<scalar_t>() : nullptr;
++
++        at::parallel_for(0, N, 1, [&](int64_t beg, int64_t end) {
++          for (int64_t i = beg; i < end; ++i) {
++            const int64_t start = ip[i], stop = ip[i + 1];
++            if (stop <= start)
++              continue;
++            auto* out_row = op + i * F;
++            auto* arg_row = ap + i * F;
++            for (int64_t f = 0; f < F; ++f)
++              out_row[f] = std::numeric_limits<scalar_t>::lowest();
++            for (int64_t e = start; e < stop; ++e) {
++              const int64_t src = cl[e];
++              const auto* x_row = xp + src * F;
++              const scalar_t w = has_w ? wp[e] : scalar_t(1);
++              for (int64_t f = 0; f < F; ++f) {
++                const scalar_t v = w * x_row[f];
++                if (v > out_row[f]) {
++                  out_row[f] = v;
++                  arg_row[f] = src;
++                }
++              }
++            }
++          }
++        });
++      });
++
++  return std::make_tuple(out, arg);
++}
++
+ }  // namespace
+ 
+ TORCH_LIBRARY_IMPL(pyg, CPU, m) {
+   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_csr"), TORCH_FN(spmm_csr_kernel));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr"),
++         TORCH_FN(spmm_max_csr_kernel));
+ }
+ 
+ }  // namespace ops
+diff --git a/pyg_lib/csrc/ops/mps/spmm_metal.mm b/pyg_lib/csrc/ops/mps/spmm_metal.mm
+index 7eedb34..560ce6c 100644
+--- a/pyg_lib/csrc/ops/mps/spmm_metal.mm
++++ b/pyg_lib/csrc/ops/mps/spmm_metal.mm
+@@ -77,12 +77,55 @@ kernel void NAME(device const T* x [[buffer(0)]],           \
+ SPMM_K(spmm_f32, float)
+ SPMM_K(spmm_f16, half)
+ SPMM_K(spmm_bf16, ushort)
++
++// Max-reducing SpMM: also emits the winning source node `col[e*]` per cell.
++template <typename T>
++inline void spmm_max_impl(device const T* x, device const long* indptr,
++                          device const long* col, device const T* weight,
++                          device T* out, device long* arg, uint N, uint F,
++                          uint has_w, uint Nsrc, uint gid) {
++    if (gid >= N * F) return;
++    uint i = gid / F;
++    uint f = gid % F;
++    long start = indptr[i], end = indptr[i + 1];
++    if (end <= start) { store_out(out, gid, 0.0f); arg[gid] = (long)Nsrc; return; }
++    float best = -INFINITY;
++    long besti = (long)Nsrc;
++    for (long e = start; e < end; ++e) {
++        long src = col[e];
++        float w = (has_w != 0u) ? to_float(weight[e]) : 1.0f;
++        float v = w * to_float(x[(uint)src * F + f]);
++        if (v > best) { best = v; besti = src; }
++    }
++    store_out(out, gid, best);
++    arg[gid] = besti;
++}
++
++#define SPMM_MAX_K(NAME, T)                                   \
++  kernel void NAME(device const T* x [[buffer(0)]],           \
++                   device const long* indptr [[buffer(1)]],   \
++                   device const long* col [[buffer(2)]],      \
++                   device const T* weight [[buffer(3)]],      \
++                   device T* out [[buffer(4)]],               \
++                   device long* arg [[buffer(5)]],            \
++                   constant uint& N [[buffer(6)]],            \
++                   constant uint& F [[buffer(7)]],            \
++                   constant uint& has_w [[buffer(8)]],        \
++                   constant uint& Nsrc [[buffer(9)]],         \
++                   uint gid [[thread_position_in_grid]]) {    \
++    spmm_max_impl(x, indptr, col, weight, out, arg, N, F, has_w, Nsrc, gid); \
++  }
++
++SPMM_MAX_K(spmm_max_f32, float)
++SPMM_MAX_K(spmm_max_f16, half)
++SPMM_MAX_K(spmm_max_bf16, ushort)
+ )METAL";
+ 
+ constexpr int kNumDtypes = 3;
+ 
+ struct MetalSpmm {
+   id<MTLComputePipelineState> pso[kNumDtypes] = {nil, nil, nil};
++  id<MTLComputePipelineState> pso_max[kNumDtypes] = {nil, nil, nil};
+   bool ok = false;
+ };
+ 
+@@ -107,9 +150,12 @@ kernel void NAME(device const T* x [[buffer(0)]],           \
+                          error:&err];
+       if (!lib) return s;
+       NSString* names[kNumDtypes] = {@"spmm_f32", @"spmm_f16", @"spmm_bf16"};
++      NSString* max_names[kNumDtypes] = {@"spmm_max_f32", @"spmm_max_f16",
++                                         @"spmm_max_bf16"};
+       for (int i = 0; i < kNumDtypes; ++i) {
+         s.pso[i] = make_pso(dev, lib, names[i]);
+-        if (!s.pso[i]) return s;
++        s.pso_max[i] = make_pso(dev, lib, max_names[i]);
++        if (!s.pso[i] || !s.pso_max[i]) return s;
+       }
+       s.ok = true;
+     }
+@@ -201,10 +247,67 @@ bool spmm_eligible(const at::Tensor& x, const at::Tensor& indptr,
+   return out;
+ }
+ 
++std::tuple<at::Tensor, at::Tensor> spmm_max_csr_cpu_fallback(
++    const at::Tensor& x, const at::Tensor& indptr, const at::Tensor& col,
++    const std::optional<at::Tensor>& weight) {
++  auto w = weight.has_value() ? std::optional<at::Tensor>(weight->cpu())
++                              : std::nullopt;
++  auto r = spmm_max_csr(x.cpu(), indptr.cpu(), col.cpu(), w);
++  return std::make_tuple(std::get<0>(r).to(x.device()),
++                         std::get<1>(r).to(x.device()));
++}
++
++std::tuple<at::Tensor, at::Tensor> spmm_max_csr_mps(
++    const at::Tensor& x, const at::Tensor& indptr, const at::Tensor& col,
++    const std::optional<at::Tensor>& weight) {
++  const int64_t N = indptr.size(0) - 1;
++  if (!spmm_eligible(x, indptr, col, weight, N)) {
++    return spmm_max_csr_cpu_fallback(x, indptr, col, weight);
++  }
++  auto x_c = x.contiguous();
++  auto indptr_c = indptr.contiguous();
++  auto col_c = col.contiguous();
++  const uint32_t Nu = (uint32_t)N;
++  const uint32_t F = (uint32_t)x_c.size(1);
++  const uint32_t has_w = weight.has_value() ? 1u : 0u;
++  const uint32_t Nsrc = (uint32_t)x_c.size(0);
++  auto w_c = weight.has_value() ? weight->contiguous() : x_c;
++
++  auto out = at::empty({N, (int64_t)F}, x_c.options());
++  auto arg = at::empty({N, (int64_t)F}, indptr_c.options());
++  const uint32_t total = Nu * F;
++  auto pso = metal_spmm().pso_max[dtype_index(x_c.scalar_type())];
++  @autoreleasepool {
++    id<MTLCommandBuffer> cb = torch::mps::get_command_buffer();
++    dispatch_sync(torch::mps::get_dispatch_queue(), ^{
++      id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
++      [enc setComputePipelineState:pso];
++      [enc setBuffer:mtl_buffer(x_c) offset:byte_offset(x_c) atIndex:0];
++      [enc setBuffer:mtl_buffer(indptr_c) offset:byte_offset(indptr_c) atIndex:1];
++      [enc setBuffer:mtl_buffer(col_c) offset:byte_offset(col_c) atIndex:2];
++      [enc setBuffer:mtl_buffer(w_c) offset:byte_offset(w_c) atIndex:3];
++      [enc setBuffer:mtl_buffer(out) offset:0 atIndex:4];
++      [enc setBuffer:mtl_buffer(arg) offset:0 atIndex:5];
++      [enc setBytes:&Nu length:sizeof(Nu) atIndex:6];
++      [enc setBytes:&F length:sizeof(F) atIndex:7];
++      [enc setBytes:&has_w length:sizeof(has_w) atIndex:8];
++      [enc setBytes:&Nsrc length:sizeof(Nsrc) atIndex:9];
++      NSUInteger tg = MIN((NSUInteger)pso.maxTotalThreadsPerThreadgroup,
++                          (NSUInteger)total);
++      [enc dispatchThreads:MTLSizeMake(total, 1, 1)
++          threadsPerThreadgroup:MTLSizeMake(MAX(tg, (NSUInteger)1), 1, 1)];
++      [enc endEncoding];
++      torch::mps::commit();
++    });
++  }
++  return std::make_tuple(out, arg);
++}
++
+ }  // namespace
+ 
+ TORCH_LIBRARY_IMPL(pyg, MPS, m) {
+   m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_csr"), TORCH_FN(spmm_csr_mps));
++  m.impl(TORCH_SELECTIVE_NAME("pyg::spmm_max_csr"), TORCH_FN(spmm_max_csr_mps));
+ }
+ 
+ }  // namespace ops
+diff --git a/pyg_lib/csrc/ops/spmm.cpp b/pyg_lib/csrc/ops/spmm.cpp
+index cec2f9d..e04e46d 100644
+--- a/pyg_lib/csrc/ops/spmm.cpp
++++ b/pyg_lib/csrc/ops/spmm.cpp
+@@ -39,10 +39,42 @@ PYG_API at::Tensor spmm_csr(const at::Tensor& x,
+   return op.call(x, indptr, col, weight, reduce);
+ }
+ 
++// Max-reducing SpMM returning (out, arg). See spmm.h for the full contract.
++PYG_API std::tuple<at::Tensor, at::Tensor> spmm_max_csr(
++    const at::Tensor& x,
++    const at::Tensor& indptr,
++    const at::Tensor& col,
++    const std::optional<at::Tensor>& weight) {
++  at::TensorArg x_arg{x, "x", 0};
++  at::TensorArg indptr_arg{indptr, "indptr", 1};
++  at::TensorArg col_arg{col, "col", 2};
++  at::CheckedFrom c{"spmm_max_csr"};
++
++  at::checkAllDefined(c, {x_arg, indptr_arg, col_arg});
++  at::checkDim(c, x_arg, 2);
++  at::checkDim(c, indptr_arg, 1);
++  at::checkDim(c, col_arg, 1);
++  TORCH_CHECK(x.device() == indptr.device() && x.device() == col.device(),
++              "spmm_max_csr: x, indptr and col must be on the same device");
++  if (weight.has_value()) {
++    at::TensorArg w_arg{weight.value(), "weight", 3};
++    at::checkDim(c, w_arg, 1);
++    at::checkSize(c, w_arg, 0, col.size(0));
++  }
++
++  static auto op = c10::Dispatcher::singleton()
++                       .findSchemaOrThrow("pyg::spmm_max_csr", "")
++                       .typed<decltype(spmm_max_csr)>();
++  return op.call(x, indptr, col, weight);
++}
++
+ TORCH_LIBRARY_FRAGMENT(pyg, m) {
+   m.def(TORCH_SELECTIVE_SCHEMA(
+       "pyg::spmm_csr(Tensor x, Tensor indptr, Tensor col, Tensor? weight, "
+       "int reduce) -> Tensor"));
++  m.def(TORCH_SELECTIVE_SCHEMA(
++      "pyg::spmm_max_csr(Tensor x, Tensor indptr, Tensor col, Tensor? weight) "
++      "-> (Tensor, Tensor)"));
+ }
+ 
+ }  // namespace ops
+diff --git a/pyg_lib/csrc/ops/spmm.h b/pyg_lib/csrc/ops/spmm.h
+index 5dabd3b..a4a8166 100644
+--- a/pyg_lib/csrc/ops/spmm.h
++++ b/pyg_lib/csrc/ops/spmm.h
+@@ -2,6 +2,7 @@
+ 
+ #include <ATen/ATen.h>
+ #include <optional>
++#include <tuple>
+ #include "pyg_lib/csrc/macros.h"
+ 
+ namespace pyg {
+@@ -35,5 +36,20 @@ PYG_API at::Tensor spmm_csr(const at::Tensor& x,
+                             const std::optional<at::Tensor>& weight,
+                             const int64_t reduce);
+ 
++// Max-reducing SpMM that also returns, per output cell `(i, f)`, the source node
++// `col[e*]` of the winning edge (first occurrence on ties) so the backward can
++// route the gradient to exactly that neighbor -- the SpMM analogue of
++// `segment_max_csr`'s `arg_out`. Empty rows produce value 0 and arg `x.size(0)`
++// (one past the last valid source row). `weight` scales the compared value
++// `weight[e] * x[col[e], f]`; `arg` still reports the source node id.
++//
++// Returns `(out, arg)` with `out` shaped `[N_dst, F]` (x's dtype) and `arg`
++// `[N_dst, F]` (int64). `arg` is non-differentiable.
++PYG_API std::tuple<at::Tensor, at::Tensor> spmm_max_csr(
++    const at::Tensor& x,
++    const at::Tensor& indptr,
++    const at::Tensor& col,
++    const std::optional<at::Tensor>& weight);
++
+ }  // namespace ops
+ }  // namespace pyg
+diff --git a/pyg_lib/ops/__init__.py b/pyg_lib/ops/__init__.py
+index 8c078db..d4e3ed8 100644
+--- a/pyg_lib/ops/__init__.py
++++ b/pyg_lib/ops/__init__.py
+@@ -388,6 +388,29 @@ def spmm_csr(
+     return torch.ops.pyg.spmm_csr(x, indptr, col, weight, _SPMM_REDUCE[reduce])
+ 
+ 
++def spmm_max_csr(
++    x: Tensor,
++    indptr: Tensor,
++    col: Tensor,
++    weight: Optional[Tensor] = None,
++) -> Tuple[Tensor, Tensor]:
++    r"""Max-reducing fused SpMM aggregation returning ``(out, arg)``.
++
++    Like :func:`spmm_csr` with ``reduce="max"`, but also returns, per output
++    cell :obj:`(i, f)`, the source node :obj:`col[e*]` of the winning edge
++    (first occurrence on ties) so a message-passing layer's backward can route
++    the gradient to exactly that neighbor. Empty rows produce value ``0`` and
++    arg :obj:`x.size(0)`. :obj:`arg` is non-differentiable.
++
++    Args:
++        x: Source node features of shape :obj:`[N_src, F]`.
++        indptr: CSR row pointers of shape :obj:`[N_dst + 1]`.
++        col: Source node index per edge, shape :obj:`[E]` (``torch.long``).
++        weight: Optional per-edge scalar applied to the compared value.
++    """
++    return torch.ops.pyg.spmm_max_csr(x, indptr, col, weight)
++
++
+ def scatter_sum(
+     src: Tensor,
+     index: Tensor,
+@@ -1261,6 +1284,7 @@ __all__ = [
+     'index_sort',
+     'softmax_csr',
+     'spmm_csr',
++    'spmm_max_csr',
+     'scatter_sum',
+     'scatter_add',
+     'scatter_mul',
