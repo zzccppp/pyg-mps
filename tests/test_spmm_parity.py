@@ -124,6 +124,39 @@ def test_spmm_max_csr_matches_cpu_kernel() -> None:
     torch.testing.assert_close(a_mps.cpu(), a_cpu, rtol=0, atol=0)
 
 
+def _ref_max_bw(grad_out, arg, num_src):
+    n, f = grad_out.shape
+    gx = torch.zeros(num_src, f)
+    mask = arg < num_src
+    safe = torch.where(mask, arg, torch.zeros_like(arg))
+    gx.scatter_add_(0, safe, grad_out * mask.float())
+    return gx
+
+
+def test_spmm_max_csr_bw_parity() -> None:
+    """Fused atomic max-backward matches a masked scatter_add reference."""
+    torch.manual_seed(4)
+    num_src, n, f = 1_000, 4_000, 32
+    arg = torch.randint(0, num_src, (n, f)).long()
+    arg[arg % 37 == 0] = num_src  # inject empty-row sentinels
+    grad_out = torch.randn(n, f)
+    ref = _ref_max_bw(grad_out, arg, num_src)
+    got = ops.spmm_max_csr_bw(grad_out.to("mps"), arg.to("mps"), num_src)
+    assert got.device.type == "mps" and got.shape == (num_src, f)
+    torch.testing.assert_close(got.cpu(), ref, rtol=1e-4, atol=1e-4)
+
+
+def test_spmm_max_csr_bw_heavy_collision() -> None:
+    """Many cells -> few sources (extreme atomic contention) stays correct."""
+    torch.manual_seed(5)
+    num_src, n, f = 8, 20_000, 16
+    arg = torch.randint(0, num_src, (n, f)).long()
+    grad_out = torch.randn(n, f)
+    got = ops.spmm_max_csr_bw(grad_out.to("mps"), arg.to("mps"), num_src)
+    ref = _ref_max_bw(grad_out, arg, num_src)
+    torch.testing.assert_close(got.cpu(), ref, rtol=1e-3, atol=1e-3)
+
+
 def test_spmm_csr_all_empty_rows() -> None:
     """A graph with no edges yields an all-zero output."""
     n, f = 10, 4
