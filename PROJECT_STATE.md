@@ -50,7 +50,8 @@ uv pip install --no-build-isolation src/pyg-lib   # non-editable! (see gotchas)
   ```
 - **Releases**: `v0.8.0-mps` (scatter only), `v0.8.1-mps` (adds COO/CSR
   segment+gather), `v0.8.2-mps` (adds softmax_csr, fused sampled_op,
-  grouped/segment_matmul).
+  grouped/segment_matmul), `v0.8.3-mps` (adds the fused GNN SpMM aggregation
+  family: spmm_csr, spmm_max_csr, spmm_max_csr_bw).
 - **CI**: `.github/workflows/build-macos-mps-wheels.yml` on the fork builds a
   `python {3.10–3.13} × torch {2.11,2.12}` wheel matrix on macOS runners and
   attaches wheels to the GitHub Release on any `v*` tag. Validated green (8/8).

@@ -1,0 +1,13 @@
+diff --git a/setup.py b/setup.py
+index 088668f..1e0112f 100644
+--- a/setup.py
++++ b/setup.py
+@@ -13,7 +13,7 @@ import warnings
+ from setuptools import Extension, find_packages, setup
+ from setuptools.command.build_ext import build_ext
+ 
+-__version__ = '0.8.2'
++__version__ = '0.8.3'
+ # Optional local-version suffix (PEP 440), e.g. "+pt212" to encode the PyTorch
+ # ABI a wheel was built against. Compiled torch extensions are tied to the torch
+ # minor version, so multi-version distributions tag wheels this way (matching
